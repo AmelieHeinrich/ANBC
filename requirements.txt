@@ -1,0 +1,8 @@
+torch
+numpy
+pillow
+ispc-texcomp
+texture2ddecoder
+flip-evaluator
+matplotlib
+tqdm
