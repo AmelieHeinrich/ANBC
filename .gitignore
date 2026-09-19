@@ -3,3 +3,7 @@ data/
 checkpoints/
 __pycache__/
 *.pyc
+c_api/build/
+TrainingANeuralNetworkToRenderIrradianceInRealTimeout/
+out
+.DS_Store

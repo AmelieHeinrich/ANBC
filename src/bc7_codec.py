@@ -170,7 +170,7 @@ def encode_block_neural(
     """
     e0, p0 = quantize_endpoint_and_pbit(endpoint0_0to1)
     e1, p1 = quantize_endpoint_and_pbit(endpoint1_0to1)
-    indices = np.clip(np.round(interp_0to1 * 15.0), 0, 15).astype(np.int32)
+    indices = nearest_weight_index(interp_0to1, _WEIGHTS_4BIT)
 
     # The anchor (pixel 0) index only has 3 storage bits (top bit is always
     # implied 0). If the anchor wants index > 7, swap the two endpoints and
@@ -245,7 +245,7 @@ def pack_mode6_blocks_batch(
     n = endpoint0_0to1.shape[0]
     e0_7, p0 = quantize_endpoints_and_pbits_batch(endpoint0_0to1)
     e1_7, p1 = quantize_endpoints_and_pbits_batch(endpoint1_0to1)
-    indices = np.clip(np.round(interp_0to1 * 15.0), 0, 15).astype(np.int32)  # (N,16)
+    indices = nearest_weight_index(interp_0to1, _WEIGHTS_4BIT)  # (N,16)
 
     swap_mask = indices[:, 0] > 7
     if np.any(swap_mask):
@@ -272,6 +272,55 @@ def pack_mode6_blocks_batch(
     assert bits.shape[1] == 128
     packed = np.packbits(bits.reshape(n, 16, 8), axis=-1, bitorder="little")  # (N, 16)
     return packed.tobytes()
+
+
+# ---------------------------------------------------------------------------
+# Index quantization helpers shared by the packers and the soft-decoders.
+#
+# The packers used to map a blend factor t to an index with round(t * K); the
+# soft-decoders used t as-is (continuous). That mismatch let the model learn
+# blend factors that only work at continuous precision -- fatal for mode 5,
+# whose 2-bit indices only reach 4 palette weights, so at pack time pixels
+# snapped to whichever endpoint was nearest and showed up as bright speckles.
+# Both sides now snap to the *nearest actual BC7 weight*, and training uses a
+# straight-through estimator so gradients still flow through the snap.
+# ---------------------------------------------------------------------------
+
+_WEIGHTS_2BIT = np.array([0, 21, 43, 64], dtype=np.float64) / 64.0
+
+
+def nearest_weight_index(t: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    """t: float array in [0,1] -> int32 index of the closest entry in `weights`."""
+    return np.argmin(np.abs(t[..., None] - weights), axis=-1).astype(np.int32)
+
+
+def nearest_weight_index_torch(t: torch.Tensor, weights: np.ndarray) -> torch.Tensor:
+    w = torch.as_tensor(weights, dtype=t.dtype, device=t.device)
+    return torch.argmin(torch.abs(t.unsqueeze(-1) - w), dim=-1).to(torch.int32)
+
+
+def _ste(x: torch.Tensor, x_quantized: torch.Tensor) -> torch.Tensor:
+    """Straight-through estimator: forward value is x_quantized, gradient is
+    passed through as if the quantizer were the identity."""
+    return x + (x_quantized - x).detach()
+
+
+def quantize_interp_ste(t: torch.Tensor, weights: np.ndarray) -> torch.Tensor:
+    """Snap blend factors to the nearest BC7 palette weight (STE)."""
+    w = torch.as_tensor(weights, dtype=t.dtype, device=t.device)
+    idx = torch.argmin(torch.abs(t.unsqueeze(-1) - w), dim=-1)
+    return _ste(t, w[idx])
+
+
+def quantize_endpoint_ste(v: torch.Tensor, nbits: int) -> torch.Tensor:
+    """Snap a [0,1] endpoint to what an nbits value (no p-bit) expands to on
+    decode (MSB replication), matching quantize_endpoint_no_pbit + the
+    decoder. nbits=8 is plain 8-bit rounding."""
+    max_v = (1 << nbits) - 1
+    q = torch.round(torch.round(v * 255.0).clamp(0, 255) / 255.0 * max_v).clamp(0, max_v)
+    if nbits < 8:
+        q = q * (1 << (8 - nbits)) + torch.floor(q / (1 << (2 * nbits - 8)))
+    return _ste(v, q / 255.0)
 
 
 # ---------------------------------------------------------------------------
@@ -321,7 +370,7 @@ def pack_mode6_blocks_batch_torch_arr(
 
     e0_7, p0 = quantize_endpoints_and_pbits_batch_torch(endpoint0_0to1)
     e1_7, p1 = quantize_endpoints_and_pbits_batch_torch(endpoint1_0to1)
-    indices = torch.round(interp_0to1 * 15.0).clamp(0, 15).to(torch.int32)  # (N,16)
+    indices = nearest_weight_index_torch(interp_0to1, _WEIGHTS_4BIT)  # (N,16)
 
     swap_mask = indices[:, 0] > 7
     e0_7_swapped = torch.where(swap_mask[:, None], e1_7, e0_7)
@@ -371,10 +420,14 @@ def soft_decode_block(
     endpoint0, endpoint1: (..., 4) in [0,1] (RGBA).
     interp: (..., 16) in [0,1], per-pixel blend factor.
     Returns (..., 16, 4) reconstructed RGBA in [0,1].
+
+    Quantization-aware: indices snap to the 16 real 4-bit weights and
+    endpoints to 8-bit (the shared p-bit makes every 8-bit value reachable
+    to within 1/255), with straight-through gradients.
     """
-    e0 = endpoint0.unsqueeze(-2)  # (..., 1, 4)
-    e1 = endpoint1.unsqueeze(-2)  # (..., 1, 4)
-    t = interp.unsqueeze(-1)  # (..., 16, 1)
+    e0 = quantize_endpoint_ste(endpoint0, 8).unsqueeze(-2)  # (..., 1, 4)
+    e1 = quantize_endpoint_ste(endpoint1, 8).unsqueeze(-2)  # (..., 1, 4)
+    t = quantize_interp_ste(interp, _WEIGHTS_4BIT).unsqueeze(-1)  # (..., 16, 1)
     return e0 * (1.0 - t) + e1 * t
 
 
@@ -397,8 +450,6 @@ def soft_decode_block(
 #   bit 97..127 : alpha indices, anchor 1 bit + 15x2 bits (31 bits)
 # Total = 6 + 2 + 42 + 16 + 31 + 31 = 128 bits.
 # ---------------------------------------------------------------------------
-
-_WEIGHTS_2BIT = np.array([0, 21, 43, 64], dtype=np.float64) / 64.0
 
 
 def _replicate_bits(v: np.ndarray, nbits: int) -> np.ndarray:
@@ -431,15 +482,22 @@ def soft_decode_mode5(
     endpoint0_a/endpoint1_a: (..., 1) in [0,1].
     interp_a: (..., 16) in [0,1].
     Returns (..., 16, 4) reconstructed RGBA in [0,1].
+
+    Quantization-aware: indices snap to the 4 real 2-bit weights, RGB
+    endpoints to 7-bit (MSB-replicated) and alpha endpoints to 8-bit, all
+    with straight-through gradients. This matters far more here than in
+    mode 6 -- with only 4 palette levels, a model trained on a continuous
+    blend factor learns wide endpoints + fine-grained t, which the packer
+    then snaps to the wrong endpoint (bright speckles / "holes").
     """
-    e0_rgb = endpoint0_rgb.unsqueeze(-2)
-    e1_rgb = endpoint1_rgb.unsqueeze(-2)
-    t_rgb = interp_rgb.unsqueeze(-1)
+    e0_rgb = quantize_endpoint_ste(endpoint0_rgb, 7).unsqueeze(-2)
+    e1_rgb = quantize_endpoint_ste(endpoint1_rgb, 7).unsqueeze(-2)
+    t_rgb = quantize_interp_ste(interp_rgb, _WEIGHTS_2BIT).unsqueeze(-1)
     rgb = e0_rgb * (1.0 - t_rgb) + e1_rgb * t_rgb  # (..., 16, 3)
 
-    e0_a = endpoint0_a.unsqueeze(-2)
-    e1_a = endpoint1_a.unsqueeze(-2)
-    t_a = interp_a.unsqueeze(-1)
+    e0_a = quantize_endpoint_ste(endpoint0_a, 8).unsqueeze(-2)
+    e1_a = quantize_endpoint_ste(endpoint1_a, 8).unsqueeze(-2)
+    t_a = quantize_interp_ste(interp_a, _WEIGHTS_2BIT).unsqueeze(-1)
     a = e0_a * (1.0 - t_a) + e1_a * t_a  # (..., 16, 1)
 
     return torch.cat([rgb, a], dim=-1)
@@ -484,8 +542,8 @@ def pack_mode5_block(
     e0_a = quantize_endpoint_no_pbit(endpoint0_a_0to1, 8)
     e1_a = quantize_endpoint_no_pbit(endpoint1_a_0to1, 8)
 
-    color_idx = np.clip(np.round(interp_rgb_0to1 * 3.0), 0, 3).astype(np.int32)
-    alpha_idx = np.clip(np.round(interp_a_0to1 * 3.0), 0, 3).astype(np.int32)
+    color_idx = nearest_weight_index(interp_rgb_0to1, _WEIGHTS_2BIT)
+    alpha_idx = nearest_weight_index(interp_a_0to1, _WEIGHTS_2BIT)
 
     color_idx, e0_rgb, e1_rgb = _fix_anchor_overflow_1d(color_idx, e0_rgb, e1_rgb)
     alpha_idx, e0_a, e1_a = _fix_anchor_overflow_1d(alpha_idx, e0_a, e1_a)
@@ -524,8 +582,8 @@ def pack_mode5_blocks_batch(
     e0_a = quantize_endpoint_no_pbit(endpoint0_a, 8)
     e1_a = quantize_endpoint_no_pbit(endpoint1_a, 8)
 
-    color_idx = np.clip(np.round(interp_rgb * 3.0), 0, 3).astype(np.int32)  # (N,16)
-    alpha_idx = np.clip(np.round(interp_a * 3.0), 0, 3).astype(np.int32)  # (N,16)
+    color_idx = nearest_weight_index(interp_rgb, _WEIGHTS_2BIT)  # (N,16)
+    alpha_idx = nearest_weight_index(interp_a, _WEIGHTS_2BIT)  # (N,16)
 
     color_swap = color_idx[:, 0] > 1
     if np.any(color_swap):
@@ -597,8 +655,8 @@ def pack_mode5_blocks_batch_torch_arr(
     e0_a = quant_no_pbit(endpoint0_a, 8)
     e1_a = quant_no_pbit(endpoint1_a, 8)
 
-    color_idx = torch.round(interp_rgb * 3.0).clamp(0, 3).to(torch.int32)
-    alpha_idx = torch.round(interp_a * 3.0).clamp(0, 3).to(torch.int32)
+    color_idx = nearest_weight_index_torch(interp_rgb, _WEIGHTS_2BIT)
+    alpha_idx = nearest_weight_index_torch(interp_a, _WEIGHTS_2BIT)
 
     color_swap = color_idx[:, 0] > 1
     color_idx = torch.where(color_swap[:, None], 3 - color_idx, color_idx)
@@ -662,3 +720,167 @@ def pack_mode5_blocks_batch_torch(
         endpoint0_rgb, endpoint1_rgb, interp_rgb, endpoint0_a, endpoint1_a, interp_a
     )
     return packed.cpu().numpy().tobytes()
+
+
+# ---------------------------------------------------------------------------
+# Inference-time refinement.
+#
+# The network predicts endpoints *and* per-pixel blend factors in one shot,
+# but given a pair of endpoints the optimal index for each pixel is a trivial
+# exact search over the 4 (mode 5) or 16 (mode 6) palette entries -- no
+# learning needed, and the net's sigmoid guess frequently lands on the wrong
+# side of a snapping boundary, which is the per-pixel speckle you see when
+# zooming in. Conversely, given the indices, the optimal endpoints are a
+# closed-form least-squares fit. So we treat the net's output purely as an
+# initial guess and run a couple of rounds of the classic encoder loop:
+#
+#     indices   = nearest palette entry to each pixel (exact)
+#     endpoints = least-squares refit given those indices
+#     endpoints = snap to what the bitstream can actually store
+#
+# Everything is batched torch so it stays on-device and costs a few small
+# kernels per iteration. The returned blend factors are *exactly* the BC7
+# palette weights, so the packers' nearest_weight_index() recovers the chosen
+# indices bit-for-bit, and the returned reconstruction is what the decoder
+# will produce (up to its integer rounding), which is what per-block mode
+# selection should be comparing.
+# ---------------------------------------------------------------------------
+
+
+def _decoded_endpoint_torch(v01: torch.Tensor, nbits: int) -> torch.Tensor:
+    """Forward half of quantize_endpoint_ste: the [0,1] value the decoder
+    will actually see for an nbits (no p-bit) endpoint."""
+    max_v = (1 << nbits) - 1
+    q = torch.round(torch.round(v01 * 255.0).clamp(0, 255) / 255.0 * max_v).clamp(0, max_v)
+    if nbits < 8:
+        q = q * (1 << (8 - nbits)) + torch.floor(q / (1 << (2 * nbits - 8)))
+    return q / 255.0
+
+
+def _decoded_endpoint_pbit_torch(rgba01: torch.Tensor) -> torch.Tensor:
+    """Same for a mode-6 endpoint (7 bits + shared p-bit)."""
+    v7, p = quantize_endpoints_and_pbits_batch_torch(rgba01)
+    return ((v7 << 1) | p[:, None]).to(rgba01.dtype) / 255.0
+
+
+def _palette(e0: torch.Tensor, e1: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """e0/e1 (N,C), w (K,) -> (N,K,C)."""
+    return e0[:, None, :] * (1.0 - w)[None, :, None] + e1[:, None, :] * w[None, :, None]
+
+
+def _best_indices(pixels: torch.Tensor, palette: torch.Tensor) -> torch.Tensor:
+    """pixels (N,16,C), palette (N,K,C) -> (N,16) int64 index of the closest
+    palette entry per pixel. Uses ||p-q||^2 = ||p||^2 - 2p.q + ||q||^2 and
+    drops the ||p||^2 term (constant per pixel) so the only big intermediate
+    is the (N,16,K) score tensor."""
+    dots = torch.bmm(pixels, palette.transpose(1, 2))  # (N,16,K)
+    norms = (palette * palette).sum(-1)  # (N,K)
+    return torch.argmin(norms[:, None, :] - 2.0 * dots, dim=-1)
+
+
+def _ls_endpoints(
+    pixels: torch.Tensor, w: torch.Tensor, pixel_weight: torch.Tensor | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Least-squares endpoints for fixed per-pixel blend factors.
+
+    pixels (N,16,C), w (N,16) in [0,1], pixel_weight (N,16) optional
+    importance per pixel. Minimizes sum_i pw_i * ||(1-w_i) e0 + w_i e1 - p_i||^2
+    via the 2x2 normal equations (shared across channels). Blocks whose
+    pixels all share one index are degenerate (any e0/e1 pair with the
+    right blend gives the same color), so those get e0 = e1 = weighted mean.
+    """
+    a = 1.0 - w
+    b = w
+    pw = torch.ones_like(w) if pixel_weight is None else pixel_weight
+    aa = (pw * a * a).sum(1)
+    ab = (pw * a * b).sum(1)
+    bb = (pw * b * b).sum(1)
+    ap = ((pw * a)[..., None] * pixels).sum(1)  # (N,C)
+    bp = ((pw * b)[..., None] * pixels).sum(1)
+    det = aa * bb - ab * ab
+    # Degeneracy test must be *relative*: for a flat block (all pixels share
+    # one index) det is mathematically 0 but comes out as float32
+    # cancellation noise of either sign (~1e-6 with aa*bb ~ 1e2). An absolute
+    # 1e-8 threshold then depends on the rounding of the device (CPU vs
+    # MPS/CUDA gave different signs) and, when it passes, divides noise by
+    # noise -> endpoints like 2.0. det/(aa*bb) = 1 - cos^2(a, b) is ~1 for
+    # any block with two distinct blend factors and ~0 only when degenerate.
+    ok = det > 1e-4 * aa * bb
+    det_safe = torch.where(ok, det, torch.ones_like(det))[:, None]
+    e0 = (bb[:, None] * ap - ab[:, None] * bp) / det_safe
+    e1 = (aa[:, None] * bp - ab[:, None] * ap) / det_safe
+    mean = (pw[..., None] * pixels).sum(1) / pw.sum(1).clamp_min(1e-8)[:, None]
+    e0 = torch.where(ok[:, None], e0, mean).clamp(0.0, 1.0)
+    e1 = torch.where(ok[:, None], e1, mean).clamp(0.0, 1.0)
+    return e0, e1
+
+
+def _refine_line(
+    pixels: torch.Tensor,
+    e0: torch.Tensor,
+    e1: torch.Tensor,
+    weights: np.ndarray,
+    quantize,
+    iters: int,
+    pixel_weight: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Alternate exact index search / LS endpoint refit for one index set.
+    Returns (e0_decoded, e1_decoded, interp (N,16) = exact palette weights,
+    recon (N,16,C))."""
+    w = torch.as_tensor(weights, dtype=pixels.dtype, device=pixels.device)
+    e0q, e1q = quantize(e0), quantize(e1)
+    for _ in range(iters):
+        idx = _best_indices(pixels, _palette(e0q, e1q, w))
+        e0, e1 = _ls_endpoints(pixels, w[idx], pixel_weight)
+        e0q, e1q = quantize(e0), quantize(e1)
+    palette = _palette(e0q, e1q, w)
+    idx = _best_indices(pixels, palette)
+    recon = torch.gather(palette, 1, idx[..., None].expand(-1, -1, palette.shape[-1]))
+    return e0q, e1q, w[idx], recon
+
+
+@torch.no_grad()
+def refine_mode6(
+    pixels: torch.Tensor,
+    endpoint0: torch.Tensor,
+    endpoint1: torch.Tensor,
+    iters: int = 2,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """pixels (N,16,4) in [0,1]; endpoint0/1 (N,4) from the model.
+    Returns (endpoint0, endpoint1, interp (N,16), recon (N,16,4)) ready for
+    pack_mode6_blocks_batch_torch_arr."""
+    return _refine_line(pixels, endpoint0, endpoint1, _WEIGHTS_4BIT, _decoded_endpoint_pbit_torch, iters)
+
+
+@torch.no_grad()
+def refine_mode5(
+    pixels: torch.Tensor,
+    endpoint0_rgb: torch.Tensor,
+    endpoint1_rgb: torch.Tensor,
+    endpoint0_a: torch.Tensor,
+    endpoint1_a: torch.Tensor,
+    iters: int = 2,
+    alpha_weighted_rgb: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """pixels (N,16,4) in [0,1]; endpoints from the model.
+
+    With alpha_weighted_rgb, the RGB least-squares fit weights each pixel by
+    its alpha (floored so fully transparent pixels still anchor the line a
+    little): on cutout textures a third or more of the pixels are invisible
+    and their RGB is frequently junk, and letting them pull the color
+    endpoints around wastes the 4-entry palette on pixels nobody sees. Off
+    by default because benchmark/compare_ui score and display RGB with alpha
+    ignored (so it reads as ~1dB worse there); turn it on if the texture is
+    actually rendered alpha-blended/tested.
+
+    Returns (e0_rgb, e1_rgb, interp_rgb, e0_a, e1_a, interp_a, recon (N,16,4))
+    ready for pack_mode5_blocks_batch_torch_arr."""
+    rgb, a = pixels[..., :3], pixels[..., 3:]
+    rgb_weight = a[..., 0].clamp_min(1.0 / 16.0) if alpha_weighted_rgb else None
+    e0_rgb, e1_rgb, t_rgb, recon_rgb = _refine_line(
+        rgb, endpoint0_rgb, endpoint1_rgb, _WEIGHTS_2BIT, lambda v: _decoded_endpoint_torch(v, 7), iters, rgb_weight
+    )
+    e0_a, e1_a, t_a, recon_a = _refine_line(
+        a, endpoint0_a, endpoint1_a, _WEIGHTS_2BIT, lambda v: _decoded_endpoint_torch(v, 8), iters
+    )
+    return e0_rgb, e1_rgb, t_rgb, e0_a, e1_a, t_a, torch.cat([recon_rgb, recon_a], dim=-1)

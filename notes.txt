@@ -1,0 +1,139 @@
+NeuralBlockCompressor - command cheat sheet
+============================================
+
+Run everything from the repo root with the venv active:
+    source .venv/bin/activate        (Windows git-bash: source .venv/Scripts/activate)
+(If not set up yet: ./setup.sh creates the venv, installs deps, downloads datasets.)
+
+
+1. Training
+-----------
+Checkpoints are written to checkpoints/bc7_<mode>_<arch>.pt
+(e.g. checkpoints/bc7_mode6_mlp.pt, checkpoints/bc7_mode5_mlp.pt).
+
+BC7 mode 6 (RGB, no alpha):
+    python src/train_bc7.py --mode mode6 --epochs 15 --batch-size 32768
+
+BC7 mode 5 (RGBA / alpha textures):
+    python src/train_bc7.py --mode mode5 --epochs 60 --val-images 4 --batch-size 4096
+
+BC5 (normal maps, R+G as two independent BC4 lines): NO NETWORK. A BC4 line is
+1-D and the block's min/max is already a near-optimal endpoint pair; min/max +
+2 refinement rounds (src/bc5_codec.py encode_bc5_blocks) scores ~53.5dB on
+data/normal vs ~53.7dB ISPC / ~53.2dB Compressonator, whereas the BC5 MLP
+(--mode bc5 below) only reached ~46dB: its too-wide endpoint guesses collapse
+low-contrast blocks to their mean. The training mode is kept for experiments:
+    Dataset is data/normal (sponza normals already there). One-time: copy the
+    bistro + intel_sponza normal maps (*Normal*.png; bistro's 1x1 placeholders and
+    flat constant maps are skipped) next to them:
+        python src/collect_normal_maps.py
+    Train (superseded, ~54M blocks, only the RG channels are loaded, ~2GB RAM):
+        python src/train_bc7.py --mode bc5 --epochs 15 --batch-size 32768
+    (export_weights.py rejects the result: nothing loads it.)
+    Packer self-test (encode -> pack -> texture2ddecoder must match bit-exactly,
+    also prints the ISPC BC5 PSNR of the given image, ~43dB on sponza):
+        python src/bc5_codec.py --image data/normal/2299742237651021498.jpg
+
+Useful extra flags (see src/train_bc7.py):
+    --limit-images N     train on only the first N images (quick smoke test)
+    --val-images N       number of validation images (default 20)
+    --lr 1e-3            learning rate
+    --hidden-dim 128     MLP hidden width
+    --arch mlp|cnn       model architecture (default mlp)
+    --device cuda|mps|cpu   auto-detected by default
+
+
+2. Compare UI (original vs ISPC vs neural, synced zoom/pan)
+-----------------------------------------------------------
+Mode 6 only:
+    python src/compare_ui.py --image data/div2k/train/<some_image>.png --model checkpoints/bc7_mode6_mlp.pt
+
+Mode 6 + mode 5 with real per-block mode selection (pass --model twice, mode6 first):
+    python src/compare_ui.py --image data/ambientcg_alpha/Fence001.png \
+        --model checkpoints/bc7_mode6_mlp.pt --model checkpoints/bc7_mode5_mlp.pt
+
+BC5 normal map (original vs ISPC BC5 vs ours; no model needed; panels show the
+normal map with Z reconstructed from RG, PSNR is over the two stored channels):
+    python src/compare_ui.py --image data/normal/2299742237651021498.jpg --bc5
+
+Optional: --device cuda|mps|cpu (auto-detected by default)
+Optional: --refine-iters N (default 2) -- rounds of exact index search +
+    least-squares endpoint refit applied to the model output before packing
+    (the net only provides the initial endpoints). 0 = raw model output.
+    Both compare_ui.py and benchmark.py take this flag.
+
+
+3. Benchmark (batch over a folder: avg speed + PSNR/FLIP vs ISPC)
+-----------------------------------------------------------------
+Mode 6 only (defaults to checkpoints/bc7_mode6_mlp.pt if --model is omitted):
+    python src/benchmark.py --folder data/div2k/train --model checkpoints/bc7_mode6_mlp.pt
+
+Mode 6 + mode 5 with per-block mode selection:
+    python src/benchmark.py --folder data/ambientcg_alpha \
+        --model checkpoints/bc7_mode6_mlp.pt --model checkpoints/bc7_mode5_mlp.pt
+
+BC5 over the normal-map set (vs ISPC BC5; no model needed; PSNR on RG, FLIP on
+the reconstructed normal map). The Python/torch timings mean little here --
+ISPC BC5 is a trivially cheap encoder and the torch path is per-kernel
+overhead bound; the real numbers are the C library's below:
+    python src/benchmark.py --folder data/normal --bc5
+
+Note: the default --folder is data/sponza_albedo, which is not in data/ by
+default, so always pass --folder explicitly (or drop your own textures there).
+
+
+4. C library (c_api/) -- Metal 4 backend, all mips on the GPU
+--------------------------------------------------------------
+Export the trained networks to the .bin format the library loads:
+    python src/export_weights.py            -> checkpoints/bc7_mode6.bin, bc7_mode5.bin
+    (v2 files carry a format word; the library still reads the old v1 files.
+    BC5 needs no network: anbcCompress(..., ANBC_TEXTURE_FORMAT_BC5, ...)
+    works right after anbcCreateDevice.)
+
+Build (needs macOS 26+ / a Metal 4 GPU):
+    cmake -S c_api -B c_api/build && cmake --build c_api/build -j
+
+Two inference kernels:
+  * scalar  -- every Metal 4 GPU; compiled from source at runtime (no toolchain needed).
+  * tensor ops -- M5-class GPUs only (MTLGPUFamilyApple10): the MLPs run as
+    matmul2d on the neural accelerators (~8x faster, identical output). It uses
+    MetalPerformancePrimitives, whose implementation (libTensorOps.rtlib) only
+    the OFFLINE Metal linker can resolve, so this kernel is precompiled to a
+    .metallib at build time and embedded. That needs the Metal toolchain:
+        xcodebuild -downloadComponent MetalToolchain
+    Without it CMake warns and builds the scalar kernel only.
+    Caveat: MTL_SHADER_VALIDATION=1 makes matmul2d return zeros on the current
+    macOS 27 beta (verified with a standalone test), so validate with the
+    scalar path (--no-tensor-ops) or MTL_DEBUG_LAYER=1 only.
+
+Compare against Compressonator (CMP_Core BC7 + BC4/BC5 kernels, vendored in
+c_api/third_party, multithreaded, full mip chain -- same box filter as the GPU
+path) and write .dds files with the full mip chain:
+    c_api/build/anbc_compare data/ambientcg_alpha/Fence001.png --out /tmp     (single image: prints PSNRs)
+    c_api/build/anbc_compare data/bistro --out out/bistro                      (folder: timings + summary.csv)
+BC5 (normal maps; DDS written as BC5_UNORM, PSNR over R+G; ~0.8ms per 1024^2
+with mips on an M5, ~7x faster than 10-thread Compressonator at equal quality):
+    c_api/build/anbc_compare data/normal/2299742237651021498.jpg --format bc5 --out /tmp
+    c_api/build/anbc_compare data/normal --format bc5 --out out/normal
+
+Flags: --format bc7|bc5 (default bc7), --srgb (filter mips in linear light), --no-mips, --refine-iters N,
+       --cmp-quality Q (Compressonator quality, default 0.05), --models DIR,
+       --threads N / --single-thread (Compressonator; default = all cores),
+       --no-tensor-ops (scalar kernel only; otherwise both kernels are run and
+       compared on M5-class GPUs).
+In single-image mode each mip is also scored against a CPU box-filtered
+reference and the tool exits non-zero if quality drops below a sanity floor.
+
+Score / view the DDS outputs of a folder run against the originals (per-mip
+PSNR, optional FLIP on mip 0, CSV; or a synced-zoom viewer for one texture;
+the format is read from the DDS header, BC5 is scored on RG and viewed as a
+normal map):
+    python src/compare_dds.py --dds-folder out/bistro --original-folder data/bistro --flip --csv out/bistro/quality.csv
+    python src/compare_dds.py --dds-folder out/bistro --original-folder data/bistro --image <stem> --mip 2
+    python src/compare_dds.py --dds-folder out/normal --original-folder data/normal --flip
+(pass --srgb here too if the DDS were generated with --srgb)
+
+API: see c_api/include/anbc.h (anbcCreateDevice -> anbcLoadModel x2 (BC7 only)
+-> anbcCreateTexture -> anbcCompress(format) -> anbcGetMip). Max texture size 4096^2.
+anbcGetDeviceInfo() reports whether tensor ops are in use;
+ANBC_COMPRESS_FLAG_NO_TENSOR_OPS forces the scalar kernel per call.
