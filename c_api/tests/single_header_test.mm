@@ -4,7 +4,7 @@
  *
  * Single-header smoke test: includes only dist/anbc.h (as Objective-C++, so
  * both backends are in) and encodes a synthetic RGBA texture with mips on
- * each backend with every network-free format. Built by the
+ * each backend with every format (the BC7 networks are in the blob). Built by the
  * anbc_single_header_test target after anbc_amalgamate.
  */
 #define ANBC_IMPLEMENTATION
@@ -29,8 +29,9 @@ static int encode(anbcDeviceBackend backend, const char* label)
     desc.pixelFormat = ANBC_PIXEL_FORMAT_RGBA8_UNORM; desc.flags = ANBC_TEXTURE_FLAG_GENERATE_MIPS;
     anbcTexture* tex = anbcCreateTexture(dev, &desc);
     int rc = 0;
-    const anbcTextureFormat formats[] = { ANBC_TEXTURE_FORMAT_BC5, ANBC_TEXTURE_FORMAT_BC6H, ANBC_TEXTURE_FORMAT_ASTC_4x4_UNORM };
-    for (int i = 0; i < 3; i++) {
+    const anbcTextureFormat formats[] = { ANBC_TEXTURE_FORMAT_BC7, ANBC_TEXTURE_FORMAT_BC5, ANBC_TEXTURE_FORMAT_BC6H,
+                                          ANBC_TEXTURE_FORMAT_ASTC_4x4_UNORM };
+    for (int i = 0; i < 4; i++) {
         anbcResult r = anbcCompress(dev, tex, formats[i], NULL);
         anbcMipInfo mip; anbcGetMip(tex, 0, &mip);
         const uint32_t* blk = (const uint32_t*)mip.data;

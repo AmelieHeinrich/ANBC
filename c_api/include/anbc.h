@@ -46,7 +46,7 @@ typedef enum anbcResult {
                                * (4096^2 with ANBC_TEXTURE_FLAG_GENERATE_MIPS, 16384^2 without) */
     ANBC_ERROR_IO,            /* model file could not be read */
     ANBC_ERROR_BAD_MODEL,     /* model file malformed or wrong format */
-    ANBC_ERROR_NO_MODEL,      /* anbcCompress called before the needed anbcLoadModel calls */
+    ANBC_ERROR_NO_MODEL,      /* BC7 with a network missing (an embedded one failed to upload) */
     ANBC_ERROR_BACKEND        /* GPU/API failure; see stderr for details */
 } anbcResult;
 
@@ -104,18 +104,19 @@ anbcDevice* anbcCreateDevice(anbcDeviceBackend backend);
 void        anbcDestroyDevice(anbcDevice* device);
 void        anbcGetDeviceInfo(const anbcDevice* device, anbcDeviceInfo* outInfo);
 
-/* Load one network exported by src/export_weights.py. BC7 needs two calls:
- * the mode-6 and the mode-5 network (the file records which one it is).
- * BC5, BC6H and ASTC are encoded analytically (block min/max + refinement)
- * and need no model; passing them here returns ANBC_ERROR_UNSUPPORTED. */
+/* Optional: replace one of the embedded BC7 networks (mode 6 / mode 5, the
+ * file records which) with one exported by src/export_weights.py. The
+ * shipped networks are built into the library, so this is only for
+ * experiments. BC5, BC6H and ASTC are encoded analytically (block min/max +
+ * refinement) and have no model; passing them returns ANBC_ERROR_UNSUPPORTED. */
 anbcResult anbcLoadModel(anbcDevice* device, anbcTextureFormat format, const char* path);
 
 anbcTexture* anbcCreateTexture(anbcDevice* device, const anbcTextureDesc* desc);
 void         anbcDestroyTexture(anbcTexture* texture);
 
 /* Generates mips (if requested at creation) and compresses every level.
- * `options` may be NULL for defaults. Blocking. BC7 needs both networks
- * loaded first; BC5, BC6H and ASTC work right after anbcCreateDevice. */
+ * `options` may be NULL for defaults. Blocking. Every format works right
+ * after anbcCreateDevice (the BC7 networks are embedded). */
 anbcResult anbcCompress(anbcDevice* device, anbcTexture* texture, anbcTextureFormat format,
                         const anbcCompressOptions* options);
 

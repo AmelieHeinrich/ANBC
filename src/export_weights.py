@@ -29,6 +29,7 @@ import numpy as np
 import torch
 
 CHECKPOINT_DIR = Path(__file__).resolve().parent.parent / "checkpoints"
+MODELS_DIR = Path(__file__).resolve().parent.parent / "c_api" / "models"  # embedded in the library's blob
 FORMAT_BC7 = 7
 # checkpoint mode -> (mode word, output file name)
 EXPORT_INFO = {
@@ -73,7 +74,7 @@ if __name__ == "__main__":
         default=[],
         help="Checkpoint to export (repeatable). Default: checkpoints/bc7_mode6_mlp.pt and bc7_mode5_mlp.pt",
     )
-    parser.add_argument("--out-dir", type=Path, default=CHECKPOINT_DIR)
+    parser.add_argument("--out-dir", type=Path, default=MODELS_DIR)
     args = parser.parse_args()
 
     checkpoints = args.checkpoint or [CHECKPOINT_DIR / "bc7_mode6_mlp.pt", CHECKPOINT_DIR / "bc7_mode5_mlp.pt"]

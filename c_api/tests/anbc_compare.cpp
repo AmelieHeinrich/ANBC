@@ -99,7 +99,7 @@ static inline double halfIntNorm(uint16_t h)
 struct Format {
     anbcTextureFormat anbc;
     const char*       name;
-    const char*       modelFiles[3]; /* NULL-terminated; only BC7 loads networks */
+    const char*       modelFiles[3]; /* NULL-terminated; the BC7 networks --models can override */
     bool              tensorKernel;  /* has a tensor-ops variant worth A/B-ing */
     bool              hdr;           /* RGBA16F source, PSNR in the half-int domain */
     uint32_t          dxgi;          /* 0: no DDS output */
@@ -521,7 +521,7 @@ struct Options {
 #else
     anbcDeviceBackend backend = ANBC_DEVICE_BACKEND_VULKAN;
 #endif
-    std::string modelDir = "checkpoints";
+    std::string modelDir; /* --models: override the embedded BC7 networks from this directory */
     std::string outDir = ".";
     float cmpQuality = 0.05f;
     uint32_t refineIters = 2;
@@ -709,7 +709,7 @@ static std::vector<Level> encodeOnBackend(anbcDeviceBackend backend, const Image
         fprintf(stderr, "xcheck: anbcCreateDevice(%s) failed\n", backend == ANBC_DEVICE_BACKEND_METAL ? "METAL" : "VULKAN");
         return levels;
     }
-    for (const char* const* f = fmt.modelFiles; *f; f++) {
+    for (const char* const* f = fmt.modelFiles; *f && !opt.modelDir.empty(); f++) {
         const std::string path = opt.modelDir + "/" + *f;
         if (anbcLoadModel(device, fmt.anbc, path.c_str()) != ANBC_OK) {
             fprintf(stderr, "xcheck: anbcLoadModel(%s) failed\n", path.c_str());
@@ -866,7 +866,7 @@ int main(int argc, char** argv)
     anbcGetDeviceInfo(device, &devInfo);
     printf("device: %s (%s), tensor ops: %s, format: %s, Compressonator threads: %u\n", devInfo.name,
            devInfo.backend, devInfo.tensorOps ? "yes" : "no", opt.format->name, opt.threads);
-    for (const char* const* f = opt.format->modelFiles; *f; f++) {
+    for (const char* const* f = opt.format->modelFiles; *f && !opt.modelDir.empty(); f++) {
         const std::string path = opt.modelDir + "/" + *f;
         const anbcResult r = anbcLoadModel(device, opt.format->anbc, path.c_str());
         if (r != ANBC_OK) {

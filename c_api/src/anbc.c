@@ -3,6 +3,7 @@
  * @ Copyright: Copyright (c) 2026 Amélie Heinrich. All rights reserved.
  */
 
+#include "anbc_blob.h"
 #include "anbc_internal.h"
 
 #include <stdlib.h>
@@ -73,6 +74,17 @@ anbcDevice* anbcCreateDevice(anbcDeviceBackend backend)
         free(device);
         return NULL;
     }
+    /* The shipped BC7 networks come from the blob, so BC7 works right away;
+     * anbcLoadModel can still swap one in from a file. */
+    static const char* const kEmbeddedModels[] = { "bc7_mode6.bin", "bc7_mode5.bin" };
+    for (size_t i = 0; i < sizeof(kEmbeddedModels) / sizeof(kEmbeddedModels[0]); i++) {
+        const void* data;
+        size_t      size;
+        anbcModel   model;
+        if (anbcBlobFind(kEmbeddedModels[i], &data, &size) && anbcModelParse(data, size, &model) == ANBC_OK &&
+            anbcInstallModel(device, &model) != ANBC_OK)
+            anbcModelFree(&model);
+    }
     return device;
 }
 
@@ -99,6 +111,21 @@ void anbcGetDeviceInfo(const anbcDevice* device, anbcDeviceInfo* outInfo)
     *outInfo = device->info;
 }
 
+/* Uploads a parsed model and takes ownership of it (on failure the caller
+ * still owns it). */
+anbcResult anbcInstallModel(anbcDevice* device, anbcModel* model)
+{
+    anbcModel* slot = model->mode == 6 ? &device->bc7Mode6 : &device->bc7Mode5;
+    bool*      flag = model->mode == 6 ? &device->hasBc7Mode6 : &device->hasBc7Mode5;
+    anbcResult r = device->backend.uploadModel(device, model);
+    if (r != ANBC_OK)
+        return r;
+    anbcModelFree(slot);
+    *slot = *model;
+    *flag = true;
+    return ANBC_OK;
+}
+
 anbcResult anbcLoadModel(anbcDevice* device, anbcTextureFormat format, const char* path)
 {
     if (!device || !path)
@@ -110,19 +137,10 @@ anbcResult anbcLoadModel(anbcDevice* device, anbcTextureFormat format, const cha
     anbcResult r = anbcModelLoad(path, &model);
     if (r != ANBC_OK)
         return r;
-
-    anbcModel* slot = model.mode == 6 ? &device->bc7Mode6 : &device->bc7Mode5;
-    bool*      flag = model.mode == 6 ? &device->hasBc7Mode6 : &device->hasBc7Mode5;
-
-    r = device->backend.uploadModel(device, &model);
-    if (r != ANBC_OK) {
+    r = anbcInstallModel(device, &model);
+    if (r != ANBC_OK)
         anbcModelFree(&model);
-        return r;
-    }
-    anbcModelFree(slot);
-    *slot = model;
-    *flag = true;
-    return ANBC_OK;
+    return r;
 }
 
 anbcTexture* anbcCreateTexture(anbcDevice* device, const anbcTextureDesc* desc)

@@ -116,6 +116,11 @@ anbc_spirv(astc_float.spv ${GLSL}/anbc_astc_float.comp)
 anbc_spirv(mips_rgba8.spv ${GLSL}/anbc_mips.comp -DANBC_MIPS_FORMAT=rgba8)
 anbc_spirv(mips_rgba16f.spv ${GLSL}/anbc_mips.comp -DANBC_MIPS_FORMAT=rgba16f)
 
+# The shipped BC7 networks (src/export_weights.py -> models/), so nothing has
+# to be loaded from disk at runtime.
+anbc_blob_entry(bc7_mode6.bin ${CMAKE_CURRENT_SOURCE_DIR}/models/bc7_mode6.bin)
+anbc_blob_entry(bc7_mode5.bin ${CMAKE_CURRENT_SOURCE_DIR}/models/bc7_mode5.bin)
+
 set(ANBC_BLOB_HEADER ${ANBC_GENERATED_DIR}/anbc_blob_data.h)
 add_custom_command(
     OUTPUT ${ANBC_BLOB_HEADER}

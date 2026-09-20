@@ -54,6 +54,8 @@ typedef struct anbcModel {
     size_t   layerOffset[ANBC_MAX_MODEL_LAYERS]; /* float offset of layer i's W (bias follows) */
 } anbcModel;
 
+anbcResult anbcModelParse(const void* data, size_t size, anbcModel* out);
+anbcResult anbcInstallModel(anbcDevice* device, anbcModel* model); /* anbc.c */
 anbcResult anbcModelLoad(const char* path, anbcModel* out);
 void       anbcModelFree(anbcModel* model);
 
