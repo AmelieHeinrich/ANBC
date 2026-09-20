@@ -111,7 +111,7 @@ Useful flags: `--format bc7|bc6h|bc5|astc|astc-float`, `--backend metal|vulkan`,
 
 | Format | Dataset | Ours | Reference | Speed-up |
 |---|---|---|---|---|
-| BC5 | 1024² normal map | ~0.8 ms | Compressonator, 10 threads | ~7×, equal quality |
+| BC5 | 1024² normal map | ~1 ms, 43.7 dB | Compressonator (10 threads) ~3.5 ms, 42.8 dB | ~3.5× |
 | BC6H | 8192×4096 HDRI (no mips) | ~4.3 ms | Compressonator 8.5 s | ~2000×, ~1 dB lower |
 | ASTC 4x4 | bistro, 537 textures | 1.1 s, 55.0 dB | astcenc 101 s, 60.9 dB | 89× |
 | ASTC 4x4 normal | 152 normal maps | 0.42 s, 44.4 dB | astcenc 205 s, 48.1 dB | 490× |
