@@ -168,8 +168,6 @@ python src/compare_dds.py --dds-folder out/bistro --original-folder data/bistro 
 
 Each Python codec ([bc5_codec.py](src/bc5_codec.py), [bc6h_codec.py](src/bc6h_codec.py), [astc_codec.py](src/astc_codec.py)) has a `--image` self-test that round-trips encode → pack → reference decode and must match bit-exactly.
 
-[notes.txt](notes.txt) is the full command cheat sheet and records the experiments behind each design decision.
-
 ## Layout
 
 ```
