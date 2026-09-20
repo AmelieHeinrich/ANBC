@@ -17,7 +17,7 @@ Every format runs the same pipeline on the GPU, one dispatch per mip:
 
 1. Pick initial endpoints for each 4x4 block.
    - **BC7** (mode 6 for RGB, mode 5 for RGBA, chosen per block by squared error): a 64 → 128 × 3 → 24 MLP predicts the endpoints from the raw block ([src/model.py](src/model.py)).
-   - **BC5, BC6H (mode 11), ASTC 4x4**: the block's per-channel min/max. A network was trained for each of these too and none beat the bounding box after refinement, so they were removed (details in [notes.txt](notes.txt)).
+   - **BC5, BC6H (mode 11), ASTC 4x4**: the block's per-channel min/max. A network was trained for each of these too and none beat the bounding box after refinement, so they were removed.
 2. Run `refineIterations` rounds (default 2) of exact index search + least-squares endpoint refit.
 3. Pack the block.
 
