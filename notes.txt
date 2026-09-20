@@ -34,6 +34,30 @@ low-contrast blocks to their mean. The training mode is kept for experiments:
     also prints the ISPC BC5 PSNR of the given image, ~43dB on sponza):
         python src/bc5_codec.py --image data/normal/2299742237651021498.jpg
 
+BC6H (HDR, RGB half-float, mode 11): NO NETWORK, like BC5. Endpoints start at
+the block's per-channel min/max and get the same 2 least-squares refinement
+rounds (src/bc6h_codec.py encode_bc6h_blocks); everything works in the
+half-float-bits-as-integer domain BC6H interpolates in (values / 0x7BFF), and
+PSNR is reported in that domain ("PSNR half-int", ~relative error). Scores
+~45.7dB over 20 HDR validation images vs ~49.4dB for ISPC's full 14-mode
+search (the gap is mostly the higher-precision single-subset modes 12/13 and
+the two-subset modes, which we don't emit -- same story as BC7 mode 6/5 only).
+A mode-11 MLP (--mode bc6h: per-block normalised input, exact-index loss)
+gives better endpoints than min/max BEFORE refinement (43.7 vs 42.6dB) but
+the refinement erases the difference (45.67 vs 45.72dB), so it is not shipped.
+    Dataset: DIV2K converted to Radiance .hdr with oiiotool (brew install
+    openimageio): sRGB -> linear, long side 1024, random per-image exposure
+    (log-uniform 2..32, seeded by file name) so values go well above 1.0.
+    ~2GB, ~35M blocks (3.4GB of int16 in RAM):
+        python src/convert_hdr_dataset.py            -> data/hdr/{train,valid}/*.hdr
+    Train the experiment (~4 min on an M5; export_weights.py rejects it):
+        python src/train_bc7.py --mode bc6h --epochs 15 --batch-size 32768
+    Packer self-test (encode -> pack -> our all-mode BC6H decoder must match;
+    also prints the ISPC BC6H PSNR of the image). texture2ddecoder's BC6
+    decode only returns clamped 8-bit, so src/bc6h_codec.py carries its own
+    14-mode decoder (tables generated from DirectXTex, src/bc6h_tables.py):
+        python src/bc6h_codec.py --image data/hdr/valid/0801.hdr
+
 Useful extra flags (see src/train_bc7.py):
     --limit-images N     train on only the first N images (quick smoke test)
     --val-images N       number of validation images (default 20)
@@ -55,6 +79,11 @@ Mode 6 + mode 5 with real per-block mode selection (pass --model twice, mode6 fi
 BC5 normal map (original vs ISPC BC5 vs ours; no model needed; panels show the
 normal map with Z reconstructed from RG, PSNR is over the two stored channels):
     python src/compare_ui.py --image data/normal/2299742237651021498.jpg --bc5
+
+BC6H (.hdr input; original vs ISPC BC6H full search vs ours, panels tone-mapped,
+PSNR half-int + HDR-FLIP; no model needed, --model checkpoints/bc6h_mode11_mlp.pt
+swaps in the superseded MLP init):
+    python src/compare_ui.py --image data/hdr/valid/0801.hdr --bc6h
 
 Optional: --device cuda|mps|cpu (auto-detected by default)
 Optional: --refine-iters N (default 2) -- rounds of exact index search +
@@ -78,6 +107,9 @@ ISPC BC5 is a trivially cheap encoder and the torch path is per-kernel
 overhead bound; the real numbers are the C library's below:
     python src/benchmark.py --folder data/normal --bc5
 
+BC6H over a folder of .hdr files (vs ISPC BC6H; no model needed):
+    python src/benchmark.py --folder data/hdr/valid --bc6h
+
 Note: the default --folder is data/sponza_albedo, which is not in data/ by
 default, so always pass --folder explicitly (or drop your own textures there).
 
@@ -87,8 +119,8 @@ default, so always pass --folder explicitly (or drop your own textures there).
 Export the trained networks to the .bin format the library loads:
     python src/export_weights.py            -> checkpoints/bc7_mode6.bin, bc7_mode5.bin
     (v2 files carry a format word; the library still reads the old v1 files.
-    BC5 needs no network: anbcCompress(..., ANBC_TEXTURE_FORMAT_BC5, ...)
-    works right after anbcCreateDevice.)
+    BC5 and BC6H need no network: anbcCompress(..., ANBC_TEXTURE_FORMAT_BC5 /
+    _BC6H, ...) works right after anbcCreateDevice.)
 
 Build (needs macOS 26+ / a Metal 4 GPU):
     cmake -S c_api -B c_api/build && cmake --build c_api/build -j
@@ -106,7 +138,7 @@ Two inference kernels:
     macOS 27 beta (verified with a standalone test), so validate with the
     scalar path (--no-tensor-ops) or MTL_DEBUG_LAYER=1 only.
 
-Compare against Compressonator (CMP_Core BC7 + BC4/BC5 kernels, vendored in
+Compare against Compressonator (CMP_Core BC7 + BC6H + BC4/BC5 kernels, vendored in
 c_api/third_party, multithreaded, full mip chain -- same box filter as the GPU
 path) and write .dds files with the full mip chain:
     c_api/build/anbc_compare data/ambientcg_alpha/Fence001.png --out /tmp     (single image: prints PSNRs)
@@ -115,8 +147,15 @@ BC5 (normal maps; DDS written as BC5_UNORM, PSNR over R+G; ~0.8ms per 1024^2
 with mips on an M5, ~7x faster than 10-thread Compressonator at equal quality):
     c_api/build/anbc_compare data/normal/2299742237651021498.jpg --format bc5 --out /tmp
     c_api/build/anbc_compare data/normal --format bc5 --out out/normal
+BC6H (.hdr input, uploaded as RGBA16F; DDS written as BC6H_UF16, PSNR in the
+half-int domain; ~1.3ms for a 4096x2048 HDRI without mips on an M5 and
+~4.3ms for 8192x4096, vs 2.1s / 8.5s for 10-thread Compressonator at ~1dB
+higher quality):
+    c_api/build/anbc_compare data/hdr/valid/0801.hdr --format bc6h --out /tmp
+    c_api/build/anbc_compare data/hdri_test/spree_bank_8k.hdr --format bc6h --no-mips --out /tmp
+    c_api/build/anbc_compare data/hdr/valid --format bc6h --out out/hdr
 
-Flags: --format bc7|bc5 (default bc7), --srgb (filter mips in linear light), --no-mips, --refine-iters N,
+Flags: --format bc7|bc6h|bc5 (default bc7), --srgb (filter mips in linear light; LDR only), --no-mips, --refine-iters N,
        --cmp-quality Q (Compressonator quality, default 0.05), --models DIR,
        --threads N / --single-thread (Compressonator; default = all cores),
        --no-tensor-ops (scalar kernel only; otherwise both kernels are run and
@@ -127,13 +166,16 @@ reference and the tool exits non-zero if quality drops below a sanity floor.
 Score / view the DDS outputs of a folder run against the originals (per-mip
 PSNR, optional FLIP on mip 0, CSV; or a synced-zoom viewer for one texture;
 the format is read from the DDS header, BC5 is scored on RG and viewed as a
-normal map):
+normal map, BC6H is scored half-int / HDR-FLIP and viewed tone-mapped):
     python src/compare_dds.py --dds-folder out/bistro --original-folder data/bistro --flip --csv out/bistro/quality.csv
     python src/compare_dds.py --dds-folder out/bistro --original-folder data/bistro --image <stem> --mip 2
     python src/compare_dds.py --dds-folder out/normal --original-folder data/normal --flip
+    python src/compare_dds.py --dds-folder out/hdr --original-folder data/hdr/valid --flip
 (pass --srgb here too if the DDS were generated with --srgb)
 
 API: see c_api/include/anbc.h (anbcCreateDevice -> anbcLoadModel x2 (BC7 only)
--> anbcCreateTexture -> anbcCompress(format) -> anbcGetMip). Max texture size 4096^2.
+-> anbcCreateTexture (RGBA8 or RGBA16F pixels) -> anbcCompress(format) -> anbcGetMip).
+Max texture size 4096^2 with mips (the single-dispatch mip generator's limit),
+16384^2 without.
 anbcGetDeviceInfo() reports whether tensor ops are in use;
 ANBC_COMPRESS_FLAG_NO_TENSOR_OPS forces the scalar kernel per call.

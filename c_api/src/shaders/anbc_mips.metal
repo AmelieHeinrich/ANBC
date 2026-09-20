@@ -5,8 +5,13 @@
 // last threadgroup to finish (atomic counter) then treats mip 6 (<= 64x64 for
 // textures up to 4096^2) as a single tile and produces mips 7..12 the same way.
 //
-// Filter is a 2x2 box. With kSRGB the RGB channels are decoded to linear
-// before averaging and re-encoded on store; alpha is always linear.
+// Filter is a 2x2 box, edge-clamped *at every level* (an odd-sized level's
+// last row/column is reused for the missing one, like the CPU references in
+// anbc_compare / compare_dds.py). The in-register and threadgroup stages hold
+// phantom texels past a level's edge (computed from source texels clamped one
+// level up, which is not the same thing), so those reads clamp explicitly.
+// With kSRGB the RGB channels are decoded to linear before averaging and
+// re-encoded on store; alpha is always linear.
 
 #include <metal_stdlib>
 using namespace metal;
@@ -83,11 +88,16 @@ static void reduceTile(texture2d<float, access::read> src,
         }
     }
 
-    // level +2: 1 per thread
+    // level +2: 1 per thread. This thread's 2x2 of level +1 texels starts at
+    // tileIdx * 32 + lt * 2; if the second column/row is past that level's
+    // edge, reuse the first (the edge clamp).
     const uint l2 = srcLod + 2;
     if (l2 >= P.numMips)
         return;
-    const float4 m2 = 0.25f * (m1[0] + m1[1] + m1[2] + m1[3]);
+    const uint2 g1 = tileIdx * 32 + lt * 2;
+    const uint cx = (g1.x + 1 < P.dims[l1].x) ? 1 : 0;
+    const uint cy = (g1.y + 1 < P.dims[l1].y) ? 2 : 0;
+    const float4 m2 = 0.25f * (m1[0] + m1[cx] + m1[cy] + m1[cy + cx]);
     storeTexel(outs[l2 - 1], tileIdx * 16 + lt, P.dims[l2].xy, m2);
     tg[lidx] = m2; // 16x16, stride 16
 
@@ -103,9 +113,13 @@ static void reduceTile(texture2d<float, access::read> src,
         threadgroup_barrier(mem_flags::mem_threadgroup);
         float4 m = 0.0f;
         if (active) {
+            // Same edge clamp against level l-1 (whose texels tg holds, at
+            // global coordinates tileIdx * stride + local).
+            const uint2 g = tileIdx * stride + lt * 2;
+            const uint dx = (g.x + 1 < P.dims[l - 1].x) ? 1 : 0;
+            const uint dy = (g.y + 1 < P.dims[l - 1].y) ? stride : 0;
             const uint r0 = (2 * lt.y) * stride + 2 * lt.x;
-            const uint r1 = (2 * lt.y + 1) * stride + 2 * lt.x;
-            m = 0.25f * (tg[r0] + tg[r0 + 1] + tg[r1] + tg[r1 + 1]);
+            m = 0.25f * (tg[r0] + tg[r0 + dx] + tg[r0 + dy] + tg[r0 + dy + dx]);
             storeTexel(outs[l - 1], tileIdx * size + lt, P.dims[l].xy, m);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

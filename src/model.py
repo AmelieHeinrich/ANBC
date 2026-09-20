@@ -1,7 +1,8 @@
-"""Small per-block model for BC7 mode-6 prediction.
+"""Small per-block models: BC7 mode 6 / mode 5, and the superseded BC5 and
+BC6H mode-11 ones.
 
-Input: one 4x4 RGBA8 block, flattened to 64 floats in [0,1].
-Output: endpoint0 (4), endpoint1 (4), 16 per-pixel interpolation factors.
+Input: one 4x4 block, flattened to 64 floats in [0,1].
+Output: endpoint0, endpoint1, 16 per-pixel interpolation factors.
 """
 
 from __future__ import annotations
@@ -94,6 +95,36 @@ class BC5MLP(nn.Module):
         endpoint1_g = torch.sigmoid(raw[:, 19:20])
         interp_g = torch.sigmoid(raw[:, 20:36])
         return endpoint0_r, endpoint1_r, interp_r, endpoint0_g, endpoint1_g, interp_g
+
+
+BC6H_OUTPUT_DIM = 3 + 3 + 16 + 2  # rgb endpoints + 16 interp + 2 unused (pads to a multiple of 4)
+
+
+class BC6HMLP(nn.Module):
+    """Predicts BC6H mode-11 params (two RGB endpoints + per-pixel blend
+    factors) in the block's normalised half-int frame (see bc6h_codec.py:
+    model_input / predict_endpoints). Same body and 64 -> 128 x3 -> 24
+    geometry as BC7Mode6MLP (input = 16 x RGBA with A = 0). Superseded --
+    the shipped BC6H encoder is network-free (block min/max + refinement
+    matches it after refinement, see bc6h_codec.py); kept for experiments."""
+
+    def __init__(self, hidden_dim: int = 128, num_hidden_layers: int = 3):
+        super().__init__()
+        layers: list[nn.Module] = [nn.Linear(BLOCK_INPUT_DIM, hidden_dim), nn.ReLU()]
+        for _ in range(num_hidden_layers - 1):
+            layers += [nn.Linear(hidden_dim, hidden_dim), nn.ReLU()]
+        layers.append(nn.Linear(hidden_dim, BC6H_OUTPUT_DIM))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, block: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """block: (N, 64) flattened RGBA block (A = 0) in [0,1].
+        Returns (endpoint0, endpoint1, interp), shapes (N,3), (N,3), (N,16),
+        all sigmoid-ed into [0,1]. Outputs 22 and 23 are unused padding."""
+        raw = self.net(block)
+        endpoint0 = torch.sigmoid(raw[:, 0:3])
+        endpoint1 = torch.sigmoid(raw[:, 3:6])
+        interp = torch.sigmoid(raw[:, 6:22])
+        return endpoint0, endpoint1, interp
 
 
 class BC7Mode6CNN(nn.Module):

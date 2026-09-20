@@ -16,8 +16,8 @@ Layout (little-endian):
 still reads them.)
 
 Only the MLP architectures are supported (the mode-6 CNN checkpoint is rejected).
-BC5 checkpoints are rejected too: the C library encodes BC5 without a network
-(see bc5_codec.py).
+BC5 and BC6H checkpoints are rejected too: the C library encodes those
+without a network (see bc5_codec.py / bc6h_codec.py).
 """
 
 from __future__ import annotations
@@ -31,6 +31,11 @@ import torch
 
 CHECKPOINT_DIR = Path(__file__).resolve().parent.parent / "checkpoints"
 FORMAT_BC7 = 7
+# checkpoint mode -> (model file format word, mode word, output file name)
+EXPORT_INFO = {
+    "mode6": (FORMAT_BC7, 6, "bc7_mode6.bin"),
+    "mode5": (FORMAT_BC7, 5, "bc7_mode5.bin"),
+}
 
 
 def export(checkpoint: Path, output: Path) -> None:
@@ -39,8 +44,10 @@ def export(checkpoint: Path, output: Path) -> None:
     arch = ckpt.get("arch", "mlp")
     if arch != "mlp":
         raise ValueError(f"{checkpoint}: only MLP checkpoints can be exported (arch={arch})")
-    if mode == "bc5":
-        raise ValueError(f"{checkpoint}: BC5 needs no network (the encoder uses block min/max + refinement)")
+    if mode in ("bc5", "bc6h"):
+        raise ValueError(f"{checkpoint}: {mode.upper()} needs no network (the encoder uses block min/max + refinement)")
+    if mode not in EXPORT_INFO:
+        raise ValueError(f"{checkpoint}: unknown mode {mode}")
 
     state = ckpt["model_state"]
     # Linear layers are net.0, net.2, net.4, ... (ReLUs in between have no params).
@@ -51,7 +58,7 @@ def export(checkpoint: Path, output: Path) -> None:
     for (w, b), din, dout in zip(weights, dims[:-1], dims[1:]):
         assert w.shape == (dout, din) and b.shape == (dout,)
 
-    fmt, mode_num = FORMAT_BC7, (5 if mode == "mode5" else 6)
+    fmt, mode_num, _ = EXPORT_INFO[mode]
     with open(output, "wb") as f:
         f.write(b"ANBC")
         f.write(struct.pack("<IIII", 2, fmt, mode_num, len(weights)))
@@ -79,4 +86,4 @@ if __name__ == "__main__":
     args.out_dir.mkdir(parents=True, exist_ok=True)
     for ckpt in checkpoints:
         mode = torch.load(ckpt, map_location="cpu").get("mode", "mode6")
-        export(ckpt, args.out_dir / f"bc7_{mode}.bin")
+        export(ckpt, args.out_dir / EXPORT_INFO.get(mode, (0, 0, f"{mode}.bin"))[2])

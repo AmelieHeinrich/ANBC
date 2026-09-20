@@ -16,10 +16,10 @@ extern "C" {
 
 #define ANBC_MAX_MIPS 16
 #define ANBC_MAX_MODEL_LAYERS 8
-#define ANBC_BLOCK_BYTES 16 /* BC7 and BC5 both use 16-byte blocks */
+#define ANBC_BLOCK_BYTES 16 /* BC7, BC6H and BC5 all use 16-byte blocks */
 
 /* `format` field of a model file (export_weights.py). Only BC7 networks
- * exist; BC5 is encoded without one. */
+ * exist; BC5 and BC6H are encoded without one. */
 #define ANBC_MODEL_FORMAT_BC7 7
 
 /* A multi-layer perceptron loaded from a .bin written by src/export_weights.py.
@@ -72,9 +72,10 @@ struct anbcDevice {
 };
 
 struct anbcTexture {
-    anbcDevice*   device;
-    uint32_t      width, height;
-    uint32_t      flags;
+    anbcDevice*     device;
+    uint32_t        width, height;
+    anbcPixelFormat pixelFormat;
+    uint32_t        flags;
     uint32_t      mipCount;
     anbcMipLayout mips[ANBC_MAX_MIPS];
     size_t        compressedBytes;

@@ -1,8 +1,8 @@
-// Shared by every encoder kernel (BC7 scalar/tensor, BC5): dispatch
+// Shared by every encoder kernel (BC7 scalar/tensor, BC6H, BC5): dispatch
 // parameters, block loading, the least-squares endpoint refit and the bit
 // writer. Format-specific refinement/packing lives in anbc_bc7_common.metal /
-// anbc_bc5_common.metal, the MLP evaluators in anbc_mlp_scalar.metal /
-// anbc_mlp_tensor.metal.
+// anbc_bc6h_common.metal / anbc_bc5_common.metal, the MLP evaluators in
+// anbc_mlp_scalar.metal / anbc_mlp_tensor.metal.
 //
 // The runtime-compiled (scalar) libraries are built by concatenating these
 // files (see CMakeLists.txt), the offline-compiled tensor kernels #include
@@ -100,8 +100,9 @@ static inline void bwPut(thread BitWriter& b, uint value, uint nbits)
 // Block loading
 // ---------------------------------------------------------------------------
 
-// The 16 RGBA texels of block (bx, by) at the current mip, edge-clamped.
-// They double as the BC7 network's 64 inputs (pixel-major).
+// The 16 RGBA texels of block (bx, by) at the current mip, edge-clamped
+// (RGBA8 or RGBA16F source, both read as float). They double as the BC7
+// network's 64 inputs (pixel-major).
 static void loadBlock(texture2d<float, access::read> src, constant EncodeParams& P, uint2 blockId, thread float4* px)
 {
     const uint2 dims = uint2(P.mipWidth, P.mipHeight);

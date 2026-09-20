@@ -22,15 +22,25 @@ typedef enum anbcDeviceBackend {
 typedef enum anbcTextureFormat {
     ANBC_TEXTURE_FORMAT_BC7,
     ANBC_TEXTURE_FORMAT_BC5, /* R and G of the source (normal maps); B/A are ignored. No network. */
-    // ANBC_TEXTURE_FORMAT_BC6H,
+    ANBC_TEXTURE_FORMAT_BC6H, /* BC6H_UF16 (unsigned HDR RGB, mode 11): negative inputs clamp to 0,
+                               * alpha is ignored. No network. */
     // ANBC_TEXTURE_FORMAT_ASTC_4x4_UNORM,
     // ANBC_TEXTURE_FORMAT_ASTC_4x4_FLOAT
 } anbcTextureFormat;
 
+/* Layout of the source pixels handed to anbcCreateTexture. Any texture format
+ * can be compressed from either: BC7/BC5 on RGBA16F just clamp to [0,1],
+ * BC6H on RGBA8 encodes the [0,1] values as-is. */
+typedef enum anbcPixelFormat {
+    ANBC_PIXEL_FORMAT_RGBA8_UNORM = 0, /* 4 bytes per pixel */
+    ANBC_PIXEL_FORMAT_RGBA16_FLOAT     /* 8 bytes per pixel (IEEE half) */
+} anbcPixelFormat;
+
 typedef enum anbcResult {
     ANBC_OK = 0,
     ANBC_ERROR_INVALID_ARGUMENT,
-    ANBC_ERROR_UNSUPPORTED,   /* backend not compiled in / GPU lacks Metal 4 / texture too large */
+    ANBC_ERROR_UNSUPPORTED,   /* backend not compiled in / GPU lacks Metal 4 / texture too large
+                               * (4096^2 with ANBC_TEXTURE_FLAG_GENERATE_MIPS, 16384^2 without) */
     ANBC_ERROR_IO,            /* model file could not be read */
     ANBC_ERROR_BAD_MODEL,     /* model file malformed or wrong format */
     ANBC_ERROR_NO_MODEL,      /* anbcCompress called before the needed anbcLoadModel calls */
@@ -43,11 +53,12 @@ enum {
 };
 
 typedef struct anbcTextureDesc {
-    uint32_t    width;
-    uint32_t    height;
-    uint32_t    rowPitch; /* bytes between rows of `rgba8`; 0 means width * 4 */
-    const void* rgba8;    /* tightly packed R,G,B,A 8-bit, top-left origin */
-    uint32_t    flags;    /* ANBC_TEXTURE_FLAG_* */
+    uint32_t        width;
+    uint32_t        height;
+    uint32_t        rowPitch;    /* bytes between rows of `pixels`; 0 means width * bytes per pixel */
+    const void*     pixels;      /* tightly packed R,G,B,A per `pixelFormat`, top-left origin */
+    anbcPixelFormat pixelFormat; /* ANBC_PIXEL_FORMAT_* (0 = RGBA8) */
+    uint32_t        flags;       /* ANBC_TEXTURE_FLAG_* */
 } anbcTextureDesc;
 
 enum {
@@ -58,8 +69,8 @@ enum {
 
 typedef struct anbcCompressOptions {
     /* Rounds of least-squares endpoint refinement applied on top of the
-     * initial endpoints (the networks' for BC7, the block min/max for BC5;
-     * indices are always chosen exactly). 0 keeps the initial endpoints
+     * initial endpoints (the networks' for BC7, the block min/max for BC5
+     * and BC6H; indices are always chosen exactly). 0 keeps the initial endpoints
      * as-is. Default 2; costs almost nothing. */
     uint32_t refineIterations;
     uint32_t flags; /* ANBC_COMPRESS_FLAG_* */
@@ -90,8 +101,8 @@ void        anbcGetDeviceInfo(const anbcDevice* device, anbcDeviceInfo* outInfo)
 
 /* Load one network exported by src/export_weights.py. BC7 needs two calls:
  * the mode-6 and the mode-5 network (the file records which one it is).
- * BC5 is encoded analytically (block min/max + refinement) and needs no
- * model; passing it here returns ANBC_ERROR_UNSUPPORTED. */
+ * BC5 and BC6H are encoded analytically (block min/max + refinement) and
+ * need no model; passing them here returns ANBC_ERROR_UNSUPPORTED. */
 anbcResult anbcLoadModel(anbcDevice* device, anbcTextureFormat format, const char* path);
 
 anbcTexture* anbcCreateTexture(anbcDevice* device, const anbcTextureDesc* desc);
@@ -99,7 +110,7 @@ void         anbcDestroyTexture(anbcTexture* texture);
 
 /* Generates mips (if requested at creation) and compresses every level.
  * `options` may be NULL for defaults. Blocking. BC7 needs both networks
- * loaded first; BC5 works right after anbcCreateDevice. */
+ * loaded first; BC5 and BC6H work right after anbcCreateDevice. */
 anbcResult anbcCompress(anbcDevice* device, anbcTexture* texture, anbcTextureFormat format,
                         const anbcCompressOptions* options);
 

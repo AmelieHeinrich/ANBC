@@ -2,18 +2,22 @@
  * @ Author: Amélie Heinrich
  * @ Copyright: Copyright (c) 2026 Amélie Heinrich. All rights reserved.
  *
- * anbc_compare: neural BC7 / BC5 (anbc, GPU) vs AMD Compressonator CMP_Core
- * (CPU, multithreaded). Both produce the full mip chain from the same source,
- * so the timings are "RGBA in -> block chain out" for both.
+ * anbc_compare: neural BC7 / BC6H / BC5 (anbc, GPU) vs AMD Compressonator
+ * CMP_Core (CPU, multithreaded). Both produce the full mip chain from the same
+ * source, so the timings are "RGBA in -> block chain out" for both.
  *
- *   anbc_compare <image-or-folder> [--format bc7|bc5] [--out DIR] [--srgb]
+ *   anbc_compare <image-or-folder> [--format bc7|bc6h|bc5] [--out DIR] [--srgb]
  *                [--cmp-quality q] [--refine-iters n] [--no-mips]
  *                [--no-tensor-ops] [--threads n] [--single-thread]
  *
+ * BC6H takes .hdr (Radiance) inputs, uploaded as RGBA16F; an 8-bit image is
+ * converted to half [0,1] instead. Its PSNR is measured in the half-int
+ * domain (half bit pattern / 0x7BFF, ~relative error), see src/bc6h_codec.py.
+ *
  * Single image: also decodes both results with Compressonator's decoder (an
  * independent third-party decoder, so it doubles as a bitstream check) and
- * prints PSNR against the source (RGB for BC7, the two stored channels for
- * BC5), plus anbc's mips against a CPU box-filtered reference chain.
+ * prints PSNR against the source (RGB for BC7/BC6H, the two stored channels
+ * for BC5), plus anbc's mips against a CPU box-filtered reference chain.
  *
  * Folder: writes <stem>_anbc.dds and <stem>_cmp.dds (full chains) for every
  * image into --out, prints timings, and writes summary.csv. Quality scoring of
@@ -25,6 +29,7 @@
 #define STBI_ONLY_JPEG
 #define STBI_ONLY_TGA
 #define STBI_ONLY_BMP
+#define STBI_ONLY_HDR
 #include "stb_image.h"
 
 #include "anbc.h"
@@ -55,40 +60,64 @@ static double now(void)
 /* Image helpers                                                             */
 /* ------------------------------------------------------------------------- */
 
+/* One of `rgba` (8-bit) or `half` (RGBA16F, HDR formats) is populated. */
 struct Image {
     uint32_t w = 0, h = 0;
+    bool hdr = false;
     std::vector<uint8_t> rgba;
+    std::vector<uint16_t> half;
 };
 
-/* Everything that differs between the two formats. */
+static inline float halfToFloat(uint16_t h) { _Float16 f; memcpy(&f, &h, 2); return (float)f; }
+static inline uint16_t floatToHalf(float v) { const _Float16 f = (_Float16)v; uint16_t h; memcpy(&h, &f, 2); return h; }
+
+/* Unsigned BC6H's own domain: the half bit pattern, negatives -> 0, capped
+ * at 0x7BFF (65504.0), as a fraction of that cap. */
+static inline double halfIntNorm(uint16_t h)
+{
+    if (h & 0x8000)
+        return 0.0;
+    return std::min<uint32_t>(h, 0x7BFF) / 31743.0;
+}
+
+/* Everything that differs between the formats. */
 struct Format {
     anbcTextureFormat anbc;
     const char*       name;
     const char*       modelFiles[3]; /* NULL-terminated */
     bool              tensorKernel;  /* has a tensor-ops variant worth A/B-ing */
+    bool              hdr;           /* RGBA16F source, PSNR in the half-int domain */
     uint32_t          dxgi;
     int               channels;      /* channels that are stored / scored */
     const char*       psnrLabel;
+    double            floorMip0, floorMips; /* single-image sanity floors (dB) */
 };
 
-static const Format kFormatBC7 = { ANBC_TEXTURE_FORMAT_BC7, "BC7", { "bc7_mode6.bin", "bc7_mode5.bin", NULL }, true,
-                                   DDS_DXGI_FORMAT_BC7_UNORM, 3, "PSNR RGB" };
-static const Format kFormatBC5 = { ANBC_TEXTURE_FORMAT_BC5, "BC5", { NULL, NULL, NULL }, false,
-                                   DDS_DXGI_FORMAT_BC5_UNORM, 2, "PSNR RG" };
+static const Format kFormatBC7 = { ANBC_TEXTURE_FORMAT_BC7, "BC7", { "bc7_mode6.bin", "bc7_mode5.bin", NULL }, true, false,
+                                   DDS_DXGI_FORMAT_BC7_UNORM, 3, "PSNR RGB", 25.0, 20.0 };
+static const Format kFormatBC6H = { ANBC_TEXTURE_FORMAT_BC6H, "BC6H", { NULL, NULL, NULL }, false, true,
+                                    DDS_DXGI_FORMAT_BC6H_UF16, 3, "PSNR half-int", 30.0, 25.0 };
+static const Format kFormatBC5 = { ANBC_TEXTURE_FORMAT_BC5, "BC5", { NULL, NULL, NULL }, false, false,
+                                   DDS_DXGI_FORMAT_BC5_UNORM, 2, "PSNR RG", 25.0, 20.0 };
 
-/* Decode a block image with Compressonator into (w, h, 4) RGBA8. BC5 fills
- * R and G; B = 0, A = 255. */
+/* Decode a block image with Compressonator into (w, h, 4) RGBA8, or RGBA
+ * half for BC6H (A = 1.0). BC5 fills R and G; B = 0, A = 255. */
 static Image decodeBlocks(const Format& fmt, const void* blocks, uint32_t w, uint32_t h)
 {
     Image out;
     out.w = w;
     out.h = h;
-    out.rgba.resize((size_t)w * h * 4);
+    out.hdr = fmt.hdr;
+    if (fmt.hdr)
+        out.half.resize((size_t)w * h * 4);
+    else
+        out.rgba.resize((size_t)w * h * 4);
     const uint32_t bx = (w + 3) / 4, by = (h + 3) / 4;
     const uint8_t* src = (const uint8_t*)blocks;
     for (uint32_t y = 0; y < by; y++) {
         for (uint32_t x = 0; x < bx; x++) {
             uint8_t px[64];
+            uint16_t pxh[64];
             if (fmt.anbc == ANBC_TEXTURE_FORMAT_BC5) {
                 uint8_t r[16], g[16];
                 DecompressBlockBC5(src + ((size_t)y * bx + x) * 16, r, g, NULL);
@@ -98,14 +127,27 @@ static Image decodeBlocks(const Format& fmt, const void* blocks, uint32_t w, uin
                     px[i * 4 + 2] = 0;
                     px[i * 4 + 3] = 255;
                 }
+            } else if (fmt.anbc == ANBC_TEXTURE_FORMAT_BC6H) {
+                uint16_t rgb[48];
+                DecompressBlockBC6(src + ((size_t)y * bx + x) * 16, rgb, NULL);
+                for (int i = 0; i < 16; i++) {
+                    pxh[i * 4 + 0] = rgb[i * 3 + 0];
+                    pxh[i * 4 + 1] = rgb[i * 3 + 1];
+                    pxh[i * 4 + 2] = rgb[i * 3 + 2];
+                    pxh[i * 4 + 3] = 0x3C00; /* 1.0 */
+                }
             } else {
                 DecompressBlockBC7(src + ((size_t)y * bx + x) * 16, px, NULL);
             }
             for (uint32_t j = 0; j < 4; j++) {
                 for (uint32_t i = 0; i < 4; i++) {
                     const uint32_t px_x = x * 4 + i, px_y = y * 4 + j;
-                    if (px_x < w && px_y < h)
-                        memcpy(&out.rgba[((size_t)px_y * w + px_x) * 4], px + (j * 4 + i) * 4, 4);
+                    if (px_x < w && px_y < h) {
+                        if (fmt.hdr)
+                            memcpy(&out.half[((size_t)px_y * w + px_x) * 4], pxh + (j * 4 + i) * 4, 8);
+                        else
+                            memcpy(&out.rgba[((size_t)px_y * w + px_x) * 4], px + (j * 4 + i) * 4, 4);
+                    }
                 }
             }
         }
@@ -113,30 +155,45 @@ static Image decodeBlocks(const Format& fmt, const void* blocks, uint32_t w, uin
     return out;
 }
 
-/* `rgb` is over the format's stored colour channels (RGB for BC7, RG for
- * BC5), `rgba` additionally includes alpha (only meaningful for BC7). */
+/* `rgb` is over the format's stored colour channels (RGB for BC7/BC6H, RG
+ * for BC5), `rgba` additionally includes alpha (only meaningful for BC7;
+ * equal to `rgb` for BC6H, which is scored in the half-int domain). */
 struct Psnr { double rgb, rgba; };
 
-static Psnr computePsnr(const Format& fmt, const uint8_t* a, const uint8_t* b, uint32_t w, uint32_t h)
+static Psnr computePsnr(const Format& fmt, const Image& a, const Image& b)
 {
+    const uint32_t w = a.w, h = a.h;
+    const double n = (double)w * h;
+    Psnr p;
+    if (fmt.hdr) {
+        double se = 0;
+        for (size_t i = 0; i < (size_t)w * h; i++) {
+            for (int c = 0; c < fmt.channels; c++) {
+                const double d = halfIntNorm(a.half[i * 4 + c]) - halfIntNorm(b.half[i * 4 + c]);
+                se += d * d;
+            }
+        }
+        const double mse = se / (n * fmt.channels);
+        p.rgb = p.rgba = mse > 0 ? 10 * log10(1.0 / mse) : INFINITY;
+        return p;
+    }
     double seRgb = 0, seA = 0;
     for (size_t i = 0; i < (size_t)w * h; i++) {
         for (int c = 0; c < fmt.channels; c++) {
-            const double d = (double)a[i * 4 + c] - b[i * 4 + c];
+            const double d = (double)a.rgba[i * 4 + c] - b.rgba[i * 4 + c];
             seRgb += d * d;
         }
-        const double d = (double)a[i * 4 + 3] - b[i * 4 + 3];
+        const double d = (double)a.rgba[i * 4 + 3] - b.rgba[i * 4 + 3];
         seA += d * d;
     }
-    const double n = (double)w * h;
     const double mseRgb = seRgb / (n * fmt.channels), mseRgba = (seRgb + seA) / (n * (fmt.channels + 1));
-    Psnr p;
     p.rgb = mseRgb > 0 ? 10 * log10(255.0 * 255.0 / mseRgb) : INFINITY;
     p.rgba = mseRgba > 0 ? 10 * log10(255.0 * 255.0 / mseRgba) : INFINITY;
     return p;
 }
 
-/* CPU twin of the GPU mip generator: 2x2 box, optionally in linear light. */
+/* CPU twin of the GPU mip generator: 2x2 box, optionally in linear light
+ * (8-bit); HDR images are averaged as floats and stored back as half. */
 static double srgbToLinear(double c) { return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4); }
 static double linearToSrgb(double c) { return c <= 0.0031308 ? 12.92 * c : 1.055 * pow(c, 1 / 2.4) - 0.055; }
 
@@ -145,7 +202,11 @@ static Image downsample(const Image& src, bool srgb)
     Image dst;
     dst.w = src.w > 1 ? src.w / 2 : 1;
     dst.h = src.h > 1 ? src.h / 2 : 1;
-    dst.rgba.resize((size_t)dst.w * dst.h * 4);
+    dst.hdr = src.hdr;
+    if (src.hdr)
+        dst.half.resize((size_t)dst.w * dst.h * 4);
+    else
+        dst.rgba.resize((size_t)dst.w * dst.h * 4);
     for (uint32_t y = 0; y < dst.h; y++) {
         for (uint32_t x = 0; x < dst.w; x++) {
             for (int c = 0; c < 4; c++) {
@@ -154,13 +215,18 @@ static Image downsample(const Image& src, bool srgb)
                     for (int i = 0; i < 2; i++) {
                         const uint32_t sx = std::min(x * 2 + i, src.w - 1);
                         const uint32_t sy = std::min(y * 2 + j, src.h - 1);
-                        double v = src.rgba[((size_t)sy * src.w + sx) * 4 + c] / 255.0;
-                        if (srgb && c < 3)
+                        const size_t idx = ((size_t)sy * src.w + sx) * 4 + c;
+                        double v = src.hdr ? halfToFloat(src.half[idx]) : src.rgba[idx] / 255.0;
+                        if (srgb && !src.hdr && c < 3)
                             v = srgbToLinear(v);
                         sum += v;
                     }
                 }
                 double v = sum / 4;
+                if (src.hdr) {
+                    dst.half[((size_t)y * dst.w + x) * 4 + c] = floatToHalf((float)v);
+                    continue;
+                }
                 if (srgb && c < 3)
                     v = linearToSrgb(v);
                 dst.rgba[((size_t)y * dst.w + x) * 4 + c] = (uint8_t)(v * 255.0 + 0.5);
@@ -168,6 +234,49 @@ static Image downsample(const Image& src, bool srgb)
         }
     }
     return dst;
+}
+
+/* Load any supported image into the representation `fmt` wants: 8-bit RGBA
+ * for the LDR formats (an .hdr source is clamped to [0,1]), RGBA half for
+ * BC6H (an 8-bit source becomes [0,1] linear). */
+static bool loadImage(const std::string& path, const Format& fmt, Image& out)
+{
+    int w, h, comp;
+    const bool hdrFile = stbi_is_hdr(path.c_str()) != 0;
+    if (hdrFile) {
+        float* f = stbi_loadf(path.c_str(), &w, &h, &comp, 4);
+        if (!f)
+            return false;
+        out.w = (uint32_t)w;
+        out.h = (uint32_t)h;
+        out.hdr = fmt.hdr;
+        if (fmt.hdr) {
+            out.half.resize((size_t)w * h * 4);
+            for (size_t i = 0; i < (size_t)w * h * 4; i++)
+                out.half[i] = floatToHalf(f[i]);
+        } else {
+            out.rgba.resize((size_t)w * h * 4);
+            for (size_t i = 0; i < (size_t)w * h * 4; i++)
+                out.rgba[i] = (uint8_t)(std::min(std::max(f[i], 0.0f), 1.0f) * 255.0f + 0.5f);
+        }
+        stbi_image_free(f);
+        return true;
+    }
+    uint8_t* pixels = stbi_load(path.c_str(), &w, &h, &comp, 4);
+    if (!pixels)
+        return false;
+    out.w = (uint32_t)w;
+    out.h = (uint32_t)h;
+    out.hdr = fmt.hdr;
+    if (fmt.hdr) {
+        out.half.resize((size_t)w * h * 4);
+        for (size_t i = 0; i < (size_t)w * h * 4; i++)
+            out.half[i] = floatToHalf(pixels[i] / 255.0f);
+    } else {
+        out.rgba.assign(pixels, pixels + (size_t)w * h * 4);
+    }
+    stbi_image_free(pixels);
+    return true;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -185,6 +294,7 @@ static std::vector<Level> encodeCmpChain(const Format& fmt, const Image& src, bo
                                          float quality)
 {
     const bool bc5 = fmt.anbc == ANBC_TEXTURE_FORMAT_BC5;
+    const bool bc6h = fmt.anbc == ANBC_TEXTURE_FORMAT_BC6H;
     std::vector<Level> out;
     Image level = src;
     for (;;) {
@@ -197,6 +307,10 @@ static std::vector<Level> encodeCmpChain(const Format& fmt, const Image& src, bo
             if (bc5) {
                 CreateOptionsBC5(&options);
                 SetQualityBC5(options, quality);
+            } else if (bc6h) {
+                CreateOptionsBC6(&options);
+                SetQualityBC6(options, quality);
+                SetSignedBC6(options, false);
             } else {
                 CreateOptionsBC7(&options);
                 SetQualityBC7(options, quality);
@@ -206,9 +320,15 @@ static std::vector<Level> encodeCmpChain(const Format& fmt, const Image& src, bo
                 for (uint32_t x = 0; x < bx; x++) {
                     /* Edge blocks: gather a clamped 4x4 so partial blocks are well-defined. */
                     uint8_t block[64], r[16], g[16];
+                    uint16_t blockh[48];
                     for (uint32_t j = 0; j < 4; j++) {
                         for (uint32_t i = 0; i < 4; i++) {
                             const uint32_t sx = std::min(x * 4 + i, w - 1), sy = std::min(y * 4 + j, h - 1);
+                            if (bc6h) {
+                                const uint16_t* p = &level.half[((size_t)sy * w + sx) * 4];
+                                memcpy(blockh + (j * 4 + i) * 3, p, 6);
+                                continue;
+                            }
                             const uint8_t* p = &level.rgba[((size_t)sy * w + sx) * 4];
                             memcpy(block + (j * 4 + i) * 4, p, 4);
                             r[j * 4 + i] = p[0];
@@ -218,12 +338,16 @@ static std::vector<Level> encodeCmpChain(const Format& fmt, const Image& src, bo
                     uint8_t* dst = &L.blocks[((size_t)y * bx + x) * 16];
                     if (bc5)
                         CompressBlockBC5(r, 4, g, 4, dst, options);
+                    else if (bc6h)
+                        CompressBlockBC6(blockh, 12, dst, options);
                     else
                         CompressBlockBC7(block, 16, dst, options);
                 }
             }
             if (bc5)
                 DestroyOptionsBC5(options);
+            else if (bc6h)
+                DestroyOptionsBC6(options);
             else
                 DestroyOptionsBC7(options);
         };
@@ -290,7 +414,7 @@ static bool hasImageExt(const std::string& name)
     std::string ext = name.substr(dot + 1);
     for (char& c : ext)
         c = (char)tolower(c);
-    return ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "tga" || ext == "bmp";
+    return ext == "png" || ext == "jpg" || ext == "jpeg" || ext == "tga" || ext == "bmp" || ext == "hdr";
 }
 
 static std::string stemOf(const std::string& path)
@@ -310,26 +434,21 @@ struct Result {
 static bool processImage(anbcDevice* device, const anbcDeviceInfo& devInfo, const std::string& imagePath,
                          const Options& opt, bool verbose, Result* result)
 {
-    int w, h, comp;
-    uint8_t* pixels = stbi_load(imagePath.c_str(), &w, &h, &comp, 4);
-    if (!pixels) {
+    const Format& fmt = *opt.format;
+    Image src;
+    if (!loadImage(imagePath, fmt, src)) {
         fprintf(stderr, "failed to load %s: %s\n", imagePath.c_str(), stbi_failure_reason());
         return false;
     }
-    Image src;
-    src.w = (uint32_t)w;
-    src.h = (uint32_t)h;
-    src.rgba.assign(pixels, pixels + (size_t)w * h * 4);
-    stbi_image_free(pixels);
     const std::string stem = stemOf(imagePath);
-    const Format& fmt = *opt.format;
 
     /* ---- anbc ---------------------------------------------------------- */
     anbcTextureDesc desc = {};
     desc.width = src.w;
     desc.height = src.h;
-    desc.rgba8 = src.rgba.data();
-    desc.flags = (opt.srgb ? ANBC_TEXTURE_FLAG_SRGB : 0) | (opt.mips ? ANBC_TEXTURE_FLAG_GENERATE_MIPS : 0);
+    desc.pixels = fmt.hdr ? (const void*)src.half.data() : (const void*)src.rgba.data();
+    desc.pixelFormat = fmt.hdr ? ANBC_PIXEL_FORMAT_RGBA16_FLOAT : ANBC_PIXEL_FORMAT_RGBA8_UNORM;
+    desc.flags = (opt.srgb && !fmt.hdr ? ANBC_TEXTURE_FLAG_SRGB : 0) | (opt.mips ? ANBC_TEXTURE_FLAG_GENERATE_MIPS : 0);
     anbcTexture* texture = anbcCreateTexture(device, &desc);
     if (!texture) {
         fprintf(stderr, "anbcCreateTexture failed for %s\n", imagePath.c_str());
@@ -366,7 +485,7 @@ static bool processImage(anbcDevice* device, const anbcDeviceInfo& devInfo, cons
             anbcMipInfo mip0;
             anbcGetMip(texture, 0, &mip0);
             const Image dec = decodeBlocks(fmt, mip0.data, src.w, src.h);
-            runs[k].p = computePsnr(fmt, src.rgba.data(), dec.rgba.data(), src.w, src.h);
+            runs[k].p = computePsnr(fmt, src, dec);
         }
     }
     const std::vector<Level> anbcLevels = collectAnbcLevels(texture);
@@ -374,7 +493,8 @@ static bool processImage(anbcDevice* device, const anbcDeviceInfo& devInfo, cons
 
     /* ---- Compressonator ------------------------------------------------ */
     const double c0 = now();
-    const std::vector<Level> cmpLevels = encodeCmpChain(fmt, src, opt.mips, opt.srgb, opt.threads, opt.cmpQuality);
+    const std::vector<Level> cmpLevels =
+        encodeCmpChain(fmt, src, opt.mips, opt.srgb && !fmt.hdr, opt.threads, opt.cmpQuality);
     const double cmpMs = (now() - c0) * 1000.0;
 
     /* ---- outputs --------------------------------------------------------- */
@@ -396,7 +516,7 @@ static bool processImage(anbcDevice* device, const anbcDeviceInfo& devInfo, cons
 
     /* ---- single-image report --------------------------------------------- */
     const Image cmpDec = decodeBlocks(fmt, cmpLevels[0].blocks.data(), src.w, src.h);
-    const Psnr pc = computePsnr(fmt, src.rgba.data(), cmpDec.rgba.data(), src.w, src.h);
+    const Psnr pc = computePsnr(fmt, src, cmpDec);
 
     /* Alpha is only stored by BC7; for BC5 the second column is left blank. */
     const bool hasAlpha = fmt.anbc == ANBC_TEXTURE_FORMAT_BC7;
@@ -411,7 +531,7 @@ static bool processImage(anbcDevice* device, const anbcDeviceInfo& devInfo, cons
     for (int k = firstRun; k <= lastRun; k++) {
         printf("%-28s %8.2fms %11.2fdB %s   (%zu mips, refine %u, GPU)\n", runs[k].label,
                runs[k].ms, runs[k].p.rgb, alphaCol(runs[k].p.rgba), anbcLevels.size(), opt.refineIters);
-        if (runs[k].p.rgb < 25.0)
+        if (runs[k].p.rgb < fmt.floorMip0)
             ok = false;
     }
     if (both)
@@ -420,10 +540,11 @@ static bool processImage(anbcDevice* device, const anbcDeviceInfo& devInfo, cons
            "Compressonator CMP_Core", cmpMs, pc.rgb, alphaCol(pc.rgba), cmpLevels.size(), opt.cmpQuality, opt.threads);
 
     if (anbcLevels.size() > 1) {
-        printf("\nanbc mip chain vs CPU reference (%s):\n", opt.srgb ? "sRGB-linear box" : "8-bit box");
+        printf("\nanbc mip chain vs CPU reference (%s):\n",
+               fmt.hdr ? "float box" : opt.srgb ? "sRGB-linear box" : "8-bit box");
         Image ref = src;
         for (size_t level = 1; level < anbcLevels.size(); level++) {
-            ref = downsample(ref, opt.srgb);
+            ref = downsample(ref, opt.srgb && !fmt.hdr);
             const Level& L = anbcLevels[level];
             if (L.w != ref.w || L.h != ref.h) {
                 printf("  level %2zu: size mismatch (%ux%u vs %ux%u)\n", level, L.w, L.h, ref.w, ref.h);
@@ -431,12 +552,12 @@ static bool processImage(anbcDevice* device, const anbcDeviceInfo& devInfo, cons
                 continue;
             }
             const Image dec = decodeBlocks(fmt, L.blocks.data(), L.w, L.h);
-            const Psnr p = computePsnr(fmt, ref.rgba.data(), dec.rgba.data(), L.w, L.h);
+            const Psnr p = computePsnr(fmt, ref, dec);
             if (hasAlpha)
                 printf("  level %2zu  %5ux%-5u  PSNR RGB %6.2fdB  RGBA %6.2fdB\n", level, L.w, L.h, p.rgb, p.rgba);
             else
                 printf("  level %2zu  %5ux%-5u  %s %6.2fdB\n", level, L.w, L.h, fmt.psnrLabel, p.rgb);
-            if (p.rgb < 20.0)
+            if (p.rgb < fmt.floorMips)
                 ok = false;
         }
     }
@@ -450,7 +571,7 @@ int main(int argc, char** argv)
 {
     if (argc < 2) {
         fprintf(stderr,
-                "usage: %s <image-or-folder> [--format bc7|bc5] [--out dir] [--models dir] [--srgb]\n"
+                "usage: %s <image-or-folder> [--format bc7|bc6h|bc5] [--out dir] [--models dir] [--srgb]\n"
                 "          [--cmp-quality q] [--refine-iters n] [--no-mips] [--no-tensor-ops]\n"
                 "          [--threads n] [--single-thread]\n",
                 argv[0]);
@@ -463,8 +584,9 @@ int main(int argc, char** argv)
         if (a == "--format" && i + 1 < argc) {
             const std::string f = argv[++i];
             if (f == "bc7") opt.format = &kFormatBC7;
+            else if (f == "bc6h") opt.format = &kFormatBC6H;
             else if (f == "bc5") opt.format = &kFormatBC5;
-            else { fprintf(stderr, "unknown format %s (bc7|bc5)\n", f.c_str()); return 2; }
+            else { fprintf(stderr, "unknown format %s (bc7|bc6h|bc5)\n", f.c_str()); return 2; }
         }
         else if (a == "--models" && i + 1 < argc) opt.modelDir = argv[++i];
         else if (a == "--out" && i + 1 < argc) opt.outDir = argv[++i];

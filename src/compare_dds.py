@@ -1,12 +1,14 @@
-"""Score and view the BC7 / BC5 .dds files written by c_api/build/anbc_compare.
+"""Score and view the BC7 / BC5 / BC6H .dds files written by c_api/build/anbc_compare.
 
 For every <stem>_anbc.dds / <stem>_cmp.dds pair in --dds-folder whose original
 <stem>.<ext> exists in --original-folder, every mip level is decoded
-(texture2ddecoder, an independent decoder) and compared against a CPU
-box-filtered reference chain of the original (same 2x2 filter the encoders
-used; pass --srgb if the DDS were generated with --srgb). The format is read
-from the DDS header: BC7 is scored on RGB (and RGBA), BC5 on the two stored
-channels and viewed as a normal map with Z reconstructed.
+(texture2ddecoder, an independent decoder; our own all-mode decoder for BC6H)
+and compared against a CPU box-filtered reference chain of the original (same
+2x2 filter the encoders used; pass --srgb if the DDS were generated with
+--srgb). The format is read from the DDS header: BC7 is scored on RGB (and
+RGBA), BC5 on the two stored channels and viewed as a normal map with Z
+reconstructed, BC6H (originals are .hdr) in the half-int domain and viewed
+tone-mapped.
 
     python src/compare_dds.py --dds-folder out/bistro --original-folder data/bistro [--flip] [--csv q.csv]
     python src/compare_dds.py --dds-folder out/bistro --original-folder data/bistro --image <stem> [--mip 2]
@@ -22,21 +24,33 @@ from pathlib import Path
 import numpy as np
 
 import bc5_codec as bc5
+import bc6h_codec as bc6h
 import bc7_codec as bc7
-from compare_ui import SyncedViewer, compute_flip, compute_psnr, normal_map_rgb8, quality_label, quality_label_bc5
-from data import load_rgba
+from compare_ui import (
+    SyncedViewer,
+    compute_flip,
+    compute_flip_hdr,
+    compute_psnr,
+    normal_map_rgb8,
+    quality_label,
+    quality_label_bc5,
+    quality_label_bc6h,
+)
+from data import load_image
 
-IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tga", ".bmp")
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tga", ".bmp", ".hdr")
 DXGI_FORMAT_BC5_UNORM = 83
+DXGI_FORMAT_BC6H_UF16 = 95
 DXGI_FORMAT_BC7_UNORM = 98
 DDS_DX10_HEADER_SIZE = 4 + 124 + 20
 # Channels that are stored / scored per format.
-FORMAT_CHANNELS = {DXGI_FORMAT_BC7_UNORM: 3, DXGI_FORMAT_BC5_UNORM: 2}
+FORMAT_CHANNELS = {DXGI_FORMAT_BC7_UNORM: 3, DXGI_FORMAT_BC5_UNORM: 2, DXGI_FORMAT_BC6H_UF16: 3}
 
 
 def read_dds(path: Path) -> tuple[list[np.ndarray], int]:
-    """Returns (decoded RGBA8 image of every mip level, DXGI format). BC5
-    levels have R/G decoded, B = 0 and A = 255."""
+    """Returns (decoded image of every mip level, DXGI format): RGBA8 for
+    BC7/BC5 (BC5 levels have R/G decoded, B = 0 and A = 255), (H, W, 3)
+    float32 linear RGB for BC6H."""
     raw = path.read_bytes()
     if raw[:4] != b"DDS " or raw[84:88] != b"DX10":
         raise ValueError(f"{path}: not a DX10 DDS")
@@ -44,7 +58,7 @@ def read_dds(path: Path) -> tuple[list[np.ndarray], int]:
     mip_count = max(1, struct.unpack_from("<I", raw, 28)[0])
     dxgi_format = struct.unpack_from("<I", raw, 128)[0]
     if dxgi_format not in FORMAT_CHANNELS:
-        raise ValueError(f"{path}: DXGI format {dxgi_format} is not BC7_UNORM or BC5_UNORM")
+        raise ValueError(f"{path}: DXGI format {dxgi_format} is not BC7_UNORM, BC5_UNORM or BC6H_UF16")
 
     levels = []
     offset = DDS_DX10_HEADER_SIZE
@@ -53,6 +67,8 @@ def read_dds(path: Path) -> tuple[list[np.ndarray], int]:
         size = ((w + 3) // 4) * ((h + 3) // 4) * 16
         if dxgi_format == DXGI_FORMAT_BC7_UNORM:
             levels.append(bc7.decode_bc7(raw[offset : offset + size], w, h))
+        elif dxgi_format == DXGI_FORMAT_BC6H_UF16:
+            levels.append(bc6h.decode_bc6h(raw[offset : offset + size], w, h))
         else:
             rg = bc5.decode_bc5(raw[offset : offset + size], w, h)
             rgba = np.zeros((h, w, 4), dtype=np.uint8)
@@ -65,8 +81,12 @@ def read_dds(path: Path) -> tuple[list[np.ndarray], int]:
 
 
 def to_display_rgb(img: np.ndarray, dxgi_format: int) -> np.ndarray:
-    """RGB8 for viewing / FLIP: BC5 gets its Z reconstructed."""
-    return normal_map_rgb8(img[..., :2]) if dxgi_format == DXGI_FORMAT_BC5_UNORM else img[..., :3]
+    """RGB8 for viewing / FLIP: BC5 gets its Z reconstructed, BC6H is tone-mapped."""
+    if dxgi_format == DXGI_FORMAT_BC5_UNORM:
+        return normal_map_rgb8(img[..., :2])
+    if dxgi_format == DXGI_FORMAT_BC6H_UF16:
+        return bc6h.tonemap_for_display(img)
+    return img[..., :3]
 
 
 def _srgb_to_linear(c: np.ndarray) -> np.ndarray:
@@ -79,16 +99,20 @@ def _linear_to_srgb(c: np.ndarray) -> np.ndarray:
 
 def downsample(img: np.ndarray, srgb: bool) -> np.ndarray:
     """CPU twin of the GPU mip generator: 2x2 box, edge-clamped for odd sizes,
-    optionally in linear light for RGB."""
-    h, w = img.shape[:2]
+    optionally in linear light for RGB. Float (HDR) images are averaged as-is
+    and rounded to half, like the RGBA16F GPU texture stores them."""
+    h, w, c = img.shape
     dw, dh = max(1, w // 2), max(1, h // 2)
-    src = img.astype(np.float64) / 255.0
-    if srgb:
+    hdr = img.dtype != np.uint8
+    src = img.astype(np.float64) if hdr else img.astype(np.float64) / 255.0
+    if srgb and not hdr:
         src[..., :3] = _srgb_to_linear(src[..., :3])
     ys = np.minimum(np.arange(dh * 2), h - 1)
     xs = np.minimum(np.arange(dw * 2), w - 1)
     src = src[ys][:, xs]
-    out = src.reshape(dh, 2, dw, 2, 4).mean(axis=(1, 3))
+    out = src.reshape(dh, 2, dw, 2, c).mean(axis=(1, 3))
+    if hdr:
+        return np.clip(out, 0.0, 65504.0).astype(np.float16).astype(np.float32)
     if srgb:
         out[..., :3] = _linear_to_srgb(out[..., :3])
     return np.clip(out * 255.0 + 0.5, 0, 255).astype(np.uint8)
@@ -102,7 +126,11 @@ def reference_chain(original: np.ndarray, levels: int, srgb: bool) -> list[np.nd
 
 
 def psnr_rgb_rgba(a: np.ndarray, b: np.ndarray, channels: int = 3) -> tuple[float, float]:
-    """(PSNR over the first `channels` channels, PSNR over those plus alpha)."""
+    """(PSNR over the first `channels` channels, PSNR over those plus alpha).
+    HDR (float) images are scored in the half-int domain, with no alpha."""
+    if a.dtype != np.uint8:
+        p = bc6h.hdr_psnr(a, b)
+        return p, p
     a64, b64 = a.astype(np.float64), b.astype(np.float64)
     keep = list(range(channels)) + [3]
     return compute_psnr(a64[..., :channels], b64[..., :channels]), compute_psnr(a64[..., keep], b64[..., keep])
@@ -127,7 +155,7 @@ def score_folder(dds_folder: Path, original_folder: Path, srgb: bool, use_flip: 
         if orig_path is None or not cmp_path.exists():
             print(f"{stem:48.48s}  (skipped: missing original or _cmp.dds)")
             continue
-        original = load_rgba(orig_path)
+        original = load_image(orig_path)
         anbc_levels, fmt = read_dds(dds_folder / f"{stem}_anbc.dds")
         cmp_levels, _ = read_dds(cmp_path)
         channels = FORMAT_CHANNELS[fmt]
@@ -150,7 +178,10 @@ def score_folder(dds_folder: Path, original_folder: Path, srgb: bool, use_flip: 
             "anbc_mean_rgb": float(np.mean(finite([p[0] for p in pa]))),
             "cmp_mean_rgb": float(np.mean(finite([p[0] for p in pc]))),
         }
-        if use_flip:
+        if use_flip and fmt == DXGI_FORMAT_BC6H_UF16:
+            row["anbc_flip"] = compute_flip_hdr(original, anbc_levels[0])
+            row["cmp_flip"] = compute_flip_hdr(original, cmp_levels[0])
+        elif use_flip:
             orig01 = to_display_rgb(original, fmt).astype(np.float32) / 255.0
             row["anbc_flip"] = compute_flip(orig01, to_display_rgb(anbc_levels[0], fmt).astype(np.float32) / 255.0)
             row["cmp_flip"] = compute_flip(orig01, to_display_rgb(cmp_levels[0], fmt).astype(np.float32) / 255.0)
@@ -212,11 +243,14 @@ def view_image(dds_folder: Path, original_folder: Path, stem: str, mip: int, srg
     cmp_levels, _ = read_dds(dds_folder / f"{stem}_cmp.dds")
     if mip >= len(anbc_levels):
         raise SystemExit(f"{stem} has {len(anbc_levels)} mips")
-    ref = reference_chain(load_rgba(orig_path), mip + 1, srgb)[mip]
+    ref = reference_chain(load_image(orig_path), mip + 1, srgb)[mip]
     a, c = anbc_levels[mip], cmp_levels[mip]
     if fmt == DXGI_FORMAT_BC5_UNORM:
         label = lambda title, img: quality_label_bc5(title, img[..., :2], ref[..., :2])
         name = "BC5"
+    elif fmt == DXGI_FORMAT_BC6H_UF16:
+        label = lambda title, img: quality_label_bc6h(title, img, ref)
+        name = "BC6H"
     else:
         label = lambda title, img: quality_label(title, img[..., :3], ref[..., :3])
         name = "BC7"

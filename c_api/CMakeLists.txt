@@ -90,12 +90,15 @@ if(APPLE)
     anbc_embed_shader(anbc_bc7_scalar ANBC_BC7_SCALAR_METAL_SOURCE ANBC_BC7_SCALAR_HEADER
         ${SHADERS}/anbc_common.metal ${SHADERS}/anbc_bc7_common.metal
         ${SHADERS}/anbc_mlp_scalar.metal ${SHADERS}/anbc_bc7_scalar.metal)
+    anbc_embed_shader(anbc_bc6h ANBC_BC6H_METAL_SOURCE ANBC_BC6H_HEADER
+        ${SHADERS}/anbc_common.metal ${SHADERS}/anbc_bc6h_common.metal ${SHADERS}/anbc_bc6h_scalar.metal)
     anbc_embed_shader(anbc_bc5 ANBC_BC5_METAL_SOURCE ANBC_BC5_HEADER
         ${SHADERS}/anbc_common.metal ${SHADERS}/anbc_bc5_common.metal ${SHADERS}/anbc_bc5_scalar.metal)
     anbc_embed_shader(anbc_mips ANBC_MIPS_METAL_SOURCE ANBC_MIPS_HEADER
         ${SHADERS}/anbc_mips.metal)
     list(APPEND ANBC_SOURCES src/backend_metal.mm
-         ${ANBC_BC7_SCALAR_HEADER} ${ANBC_BC5_HEADER} ${ANBC_TENSOR_HEADERS} ${ANBC_MIPS_HEADER})
+         ${ANBC_BC7_SCALAR_HEADER} ${ANBC_BC6H_HEADER} ${ANBC_BC5_HEADER} ${ANBC_TENSOR_HEADERS}
+         ${ANBC_MIPS_HEADER})
 endif()
 
 add_library(anbc STATIC ${ANBC_SOURCES})

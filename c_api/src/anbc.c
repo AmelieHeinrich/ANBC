@@ -93,7 +93,7 @@ anbcResult anbcLoadModel(anbcDevice* device, anbcTextureFormat format, const cha
     if (!device || !path)
         return ANBC_ERROR_INVALID_ARGUMENT;
     if (format != ANBC_TEXTURE_FORMAT_BC7)
-        return ANBC_ERROR_UNSUPPORTED; /* BC5 has no network */
+        return ANBC_ERROR_UNSUPPORTED; /* BC5 and BC6H have no network */
 
     anbcModel  model;
     anbcResult r = anbcModelLoad(path, &model);
@@ -126,7 +126,9 @@ anbcResult anbcLoadModel(anbcDevice* device, anbcTextureFormat format, const cha
 
 anbcTexture* anbcCreateTexture(anbcDevice* device, const anbcTextureDesc* desc)
 {
-    if (!device || !desc || !desc->rgba8 || desc->width == 0 || desc->height == 0)
+    if (!device || !desc || !desc->pixels || desc->width == 0 || desc->height == 0)
+        return NULL;
+    if (desc->pixelFormat != ANBC_PIXEL_FORMAT_RGBA8_UNORM && desc->pixelFormat != ANBC_PIXEL_FORMAT_RGBA16_FLOAT)
         return NULL;
 
     anbcTexture* texture = (anbcTexture*)calloc(1, sizeof(anbcTexture));
@@ -135,6 +137,7 @@ anbcTexture* anbcCreateTexture(anbcDevice* device, const anbcTextureDesc* desc)
     texture->device = device;
     texture->width = desc->width;
     texture->height = desc->height;
+    texture->pixelFormat = desc->pixelFormat;
     texture->flags = desc->flags;
     texture->mipCount = anbcComputeMipLayout(desc->width, desc->height,
                                              (desc->flags & ANBC_TEXTURE_FLAG_GENERATE_MIPS) != 0,
@@ -142,7 +145,7 @@ anbcTexture* anbcCreateTexture(anbcDevice* device, const anbcTextureDesc* desc)
 
     anbcTextureDesc d = *desc;
     if (d.rowPitch == 0)
-        d.rowPitch = d.width * 4;
+        d.rowPitch = d.width * (d.pixelFormat == ANBC_PIXEL_FORMAT_RGBA16_FLOAT ? 8 : 4);
 
     if (device->backend.createTexture(device, texture, &d) != ANBC_OK) {
         free(texture);
@@ -167,7 +170,7 @@ anbcResult anbcCompress(anbcDevice* device, anbcTexture* texture, anbcTextureFor
     if (format == ANBC_TEXTURE_FORMAT_BC7) {
         if (!device->hasBc7Mode6 || !device->hasBc7Mode5)
             return ANBC_ERROR_NO_MODEL;
-    } else if (format != ANBC_TEXTURE_FORMAT_BC5) { /* BC5 needs no model */
+    } else if (format != ANBC_TEXTURE_FORMAT_BC5 && format != ANBC_TEXTURE_FORMAT_BC6H) { /* no model needed */
         return ANBC_ERROR_UNSUPPORTED;
     }
 

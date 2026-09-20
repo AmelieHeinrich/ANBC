@@ -9,7 +9,10 @@
  * restructuring the command flow.
  *
  * Per anbcCompress: one command buffer, one compute encoder, one commit:
- *   [anbc_mips]  -> barrier -> anbc_bc7_encode | anbc_bc5_encode x mipCount -> signal event -> CPU wait
+ *   [anbc_mips]  -> barrier -> anbc_bc7_encode | anbc_bc6h_encode | anbc_bc5_encode x mipCount
+ *                -> signal event -> CPU wait
+ * BC7 runs the two MLPs (scalar or tensor-ops kernel); BC6H and BC5 have no
+ * network (block min/max + refinement, one scalar kernel each).
  */
 
 #import <Foundation/Foundation.h>
@@ -22,6 +25,7 @@
 #include <string>
 
 #include "anbc_bc5_metal.h"
+#include "anbc_bc6h_metal.h"
 #include "anbc_bc7_scalar_metal.h"
 #include "anbc_mips_metal.h"
 #if ANBC_HAVE_TENSOR_METALLIB
@@ -33,7 +37,7 @@ namespace {
 // Must match the structs in the .metal sources.
 constexpr uint32_t kMipsMaxLevels = 13;
 constexpr uint32_t kMipsTile = 64;
-constexpr uint32_t kMaxTextureDim = 4096; // mip 6 must fit one 64x64 tile
+constexpr uint32_t kMaxTextureDim = 4096; // with mips: mip 6 must fit one 64x64 tile
 constexpr uint32_t kMlpMaxHidden = 128;
 constexpr uint32_t kMlpMaxOut = 40;
 constexpr uint32_t kMlpIn = 64; // 16 RGBA texels
@@ -111,10 +115,12 @@ struct MetalDevice {
     uint64_t eventValue = 0;
 
     id<MTLLibrary> bc7Library;
+    id<MTLLibrary> bc6hLibrary;
     id<MTLLibrary> bc5Library;
     id<MTLLibrary> mipsLibrary;
     id<MTLComputePipelineState> encodePipeline;  // BC7 scalar
-    id<MTLComputePipelineState> bc5Pipeline;     // BC5 (no network, so no tensor variant)
+    id<MTLComputePipelineState> bc6hPipeline;    // BC6H (no network, so no tensor variant)
+    id<MTLComputePipelineState> bc5Pipeline;     // BC5 (same)
     id<MTLComputePipelineState> mipsPipeline[2]; // [srgb]
 
     // Tensor-ops path for the BC7 MLPs (M5-class GPUs only).
@@ -312,12 +318,19 @@ id<MTLComputePipelineState> tensorPipeline(MetalDevice* m)
     return m->tensorPipeline;
 }
 
-// BC5 pipeline, built on first use (BC7-only users never pay for it).
+// BC5 / BC6H pipelines, built on first use (BC7-only users never pay for them).
 id<MTLComputePipelineState> bc5Pipeline(MetalDevice* m)
 {
     if (!m->bc5Pipeline)
         m->bc5Pipeline = buildPipeline(m, m->bc5Library, "anbc_bc5_encode", nil);
     return m->bc5Pipeline;
+}
+
+id<MTLComputePipelineState> bc6hPipeline(MetalDevice* m)
+{
+    if (!m->bc6hPipeline)
+        m->bc6hPipeline = buildPipeline(m, m->bc6hLibrary, "anbc_bc6h_encode", nil);
+    return m->bc6hPipeline;
 }
 
 anbcResult metalUploadModel(anbcDevice* device, const anbcModel* model)
@@ -374,10 +387,15 @@ anbcResult metalUploadModel(anbcDevice* device, const anbcModel* model)
 anbcResult metalCreateTexture(anbcDevice* device, anbcTexture* texture, const anbcTextureDesc* desc)
 {
     MetalDevice* m = md(device);
-    if (desc->width > kMaxTextureDim || desc->height > kMaxTextureDim)
+    // The size limit comes from the single-dispatch mip generator; a texture
+    // encoded without mips only has to fit the GPU (16384^2 on every Apple GPU).
+    const uint32_t maxDim = texture->mipCount > 1 ? kMaxTextureDim : 16384;
+    if (desc->width > maxDim || desc->height > maxDim)
         return ANBC_ERROR_UNSUPPORTED;
 
-    MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+    const MTLPixelFormat pixelFormat = desc->pixelFormat == ANBC_PIXEL_FORMAT_RGBA16_FLOAT ? MTLPixelFormatRGBA16Float
+                                                                                          : MTLPixelFormatRGBA8Unorm;
+    MTLTextureDescriptor* td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:pixelFormat
                                                                                   width:desc->width
                                                                                  height:desc->height
                                                                               mipmapped:texture->mipCount > 1];
@@ -394,12 +412,12 @@ anbcResult metalCreateTexture(anbcDevice* device, anbcTexture* texture, const an
     t->texture.label = @"anbc source";
     [t->texture replaceRegion:MTLRegionMake2D(0, 0, desc->width, desc->height)
                   mipmapLevel:0
-                    withBytes:desc->rgba8
+                    withBytes:desc->pixels
                   bytesPerRow:desc->rowPitch];
 
     t->mipViews = [NSMutableArray array];
     for (uint32_t level = 1; level < texture->mipCount; level++) {
-        id<MTLTexture> view = [t->texture newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
+        id<MTLTexture> view = [t->texture newTextureViewWithPixelFormat:pixelFormat
                                                             textureType:MTLTextureType2D
                                                                  levels:NSMakeRange(level, 1)
                                                                  slices:NSMakeRange(0, 1)];
@@ -498,11 +516,11 @@ anbcResult metalCompress(anbcDevice* device, anbcTexture* texture, anbcTextureFo
                      visibilityOptions:MTL4VisibilityOptionDevice];
     }
 
-    const bool bc5 = format == ANBC_TEXTURE_FORMAT_BC5;
-    const bool useTensor = !bc5 && m->tensorOps && !(options->flags & ANBC_COMPRESS_FLAG_NO_TENSOR_OPS) &&
+    const bool analytic = format == ANBC_TEXTURE_FORMAT_BC5 || format == ANBC_TEXTURE_FORMAT_BC6H;
+    const bool useTensor = !analytic && m->tensorOps && !(options->flags & ANBC_COMPRESS_FLAG_NO_TENSOR_OPS) &&
                            m->tensor6.arena && m->tensor5.arena && tensorPipeline(m);
-    if (bc5) {
-        id<MTLComputePipelineState> pso = bc5Pipeline(m);
+    if (analytic) {
+        id<MTLComputePipelineState> pso = format == ANBC_TEXTURE_FORMAT_BC5 ? bc5Pipeline(m) : bc6hPipeline(m);
         if (!pso) {
             [enc endEncoding];
             [m->commandBuffer endCommandBuffer];
@@ -596,9 +614,10 @@ anbcResult anbcBackendMetalInit(anbcDevice* device)
         [m->queue addResidencySet:m->residencySet];
 
         m->bc7Library = compileLibrary(m, ANBC_BC7_SCALAR_METAL_SOURCE, "anbc_bc7_scalar");
+        m->bc6hLibrary = compileLibrary(m, ANBC_BC6H_METAL_SOURCE, "anbc_bc6h");
         m->bc5Library = compileLibrary(m, ANBC_BC5_METAL_SOURCE, "anbc_bc5");
         m->mipsLibrary = compileLibrary(m, ANBC_MIPS_METAL_SOURCE, "anbc_mips");
-        if (!m->bc7Library || !m->bc5Library || !m->mipsLibrary) {
+        if (!m->bc7Library || !m->bc6hLibrary || !m->bc5Library || !m->mipsLibrary) {
             delete m;
             return ANBC_ERROR_BACKEND;
         }

@@ -1,4 +1,4 @@
-/* Minimal DDS writer for BC7_UNORM / BC5_UNORM textures with mips (DX10 header). */
+/* Minimal DDS writer for BC7_UNORM / BC6H_UF16 / BC5_UNORM textures with mips (DX10 header). */
 #ifndef ANBC_TESTS_DDS_H
 #define ANBC_TESTS_DDS_H
 
@@ -19,10 +19,11 @@ static void ddsPutU32(FILE* f, uint32_t v)
 }
 
 #define DDS_DXGI_FORMAT_BC5_UNORM 83
+#define DDS_DXGI_FORMAT_BC6H_UF16 95
 #define DDS_DXGI_FORMAT_BC7_UNORM 98
 
 /* Returns 0 on success. `dxgiFormat` is one of the DDS_DXGI_FORMAT_* above
- * (both are 16 bytes per 4x4 block). */
+ * (all are 16 bytes per 4x4 block). */
 static int ddsWriteBlocks(const char* path, uint32_t dxgiFormat, uint32_t width, uint32_t height, const ddsMip* mips,
                           uint32_t mipCount)
 {

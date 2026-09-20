@@ -1,6 +1,7 @@
 """Visual comparison + benchmark tool: original vs ISPC vs ours (neural BC7,
-or the network-free BC5 encoder for normal maps, see bc5_codec.py), with
-synchronized zoom/pan across panels and timing/quality overlays.
+neural BC6H for .hdr images, or the network-free BC5 encoder for normal maps,
+see bc5_codec.py), with synchronized zoom/pan across panels and
+timing/quality overlays.
 """
 
 from __future__ import annotations
@@ -14,15 +15,16 @@ import numpy as np
 import torch
 
 import bc5_codec as bc5
+import bc6h_codec as bc6h
 import bc7_codec as bc7
-from data import load_rgba
-from model import BC5MLP, BC7Mode5MLP, BC7Mode6CNN, BC7Mode6MLP
+from data import load_image
+from model import BC5MLP, BC6HMLP, BC7Mode5MLP, BC7Mode6CNN, BC7Mode6MLP
 
 
 def load_model(checkpoint_path: Path, device: torch.device):
     """Load a checkpoint saved by train_bc7.py. Returns (model, mode, arch),
-    where mode is 'mode6', 'mode5' or 'bc5' (older checkpoints saved before
-    mode5 existed default to 'mode6' for backward compatibility)."""
+    where mode is 'mode6', 'mode5', 'bc6h' or 'bc5' (older checkpoints saved
+    before mode5 existed default to 'mode6' for backward compatibility)."""
     ckpt = torch.load(checkpoint_path, map_location=device)
     mode = ckpt.get("mode", "mode6")
     arch = ckpt["arch"]
@@ -31,6 +33,8 @@ def load_model(checkpoint_path: Path, device: torch.device):
         model = BC7Mode5MLP(hidden_dim=hidden_dim)
     elif mode == "bc5":
         model = BC5MLP(hidden_dim=hidden_dim)
+    elif mode == "bc6h":
+        model = BC6HMLP(hidden_dim=hidden_dim)
     elif arch == "mlp":
         model = BC7Mode6MLP(hidden_dim=hidden_dim)
     else:
@@ -101,6 +105,39 @@ def encode_decode_bc5(rgba: np.ndarray, device: torch.device, refine_iters: int 
     encode_time = time.perf_counter() - t0
 
     return bc5.decode_bc5(packed_bytes, w_crop, h_crop), encode_time
+
+
+@torch.no_grad()
+def encode_decode_bc6h(
+    rgb: np.ndarray, model: torch.nn.Module | None, device: torch.device, refine_iters: int = REFINE_ITERS
+) -> tuple[np.ndarray, float]:
+    """BC6H-encode a float RGB image (bc6h_codec.encode_bc6h_blocks: the
+    mode-11 network's endpoints, or the block min/max when `model` is None,
+    plus refinement) and decode back. Returns ((h_crop, w_crop, 3) float32, encode_seconds)."""
+    blocks, h_crop, w_crop = _tile_blocks(bc6h.float_to_norm(rgb), 3)
+    flat = torch.from_numpy(blocks).to(device)
+
+    t0 = time.perf_counter()
+    packed_arr, _ = bc6h.encode_bc6h_blocks(flat.view(-1, 16, 3), model, refine_iters)
+    packed_bytes = packed_arr.cpu().numpy().tobytes()
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    encode_time = time.perf_counter() - t0
+
+    return bc6h.decode_bc6h(packed_bytes, w_crop, h_crop), encode_time
+
+
+def ispc_encode_decode_bc6h(rgb: np.ndarray) -> tuple[np.ndarray, float]:
+    """ISPC BC6H reference (full mode search). Returns ((h_crop, w_crop, 3) float32, encode_seconds)."""
+    h, w = rgb.shape[:2]
+    h_crop, w_crop = (h // 4) * 4, (w // 4) * 4
+    cropped = np.ascontiguousarray(rgb[:h_crop, :w_crop])
+
+    t0 = time.perf_counter()
+    encoded = bc6h.ispc_encode_bc6h(cropped)
+    encode_time = time.perf_counter() - t0
+
+    return bc6h.decode_bc6h(encoded, w_crop, h_crop), encode_time
 
 
 def ispc_encode_decode_bc5(rgba: np.ndarray) -> tuple[np.ndarray, float]:
@@ -196,6 +233,9 @@ def warmup_model(models: dict[str, tuple[torch.nn.Module, str]], device: torch.d
             if "mode5" in models:
                 model, _ = models["mode5"]
                 _run_mode5(model, dummy, REFINE_ITERS)
+            if "bc6h" in models:
+                model, _ = models["bc6h"]
+                bc6h.encode_bc6h_blocks(dummy.view(-1, 16, 4)[..., :3].contiguous(), model, REFINE_ITERS)
     if device.type == "cuda":
         torch.cuda.synchronize()
 
@@ -283,6 +323,22 @@ def quality_label_bc5(title: str, img_rg: np.ndarray, original_rg: np.ndarray) -
     return f"{title}\nPSNR={psnr:.2f}dB  FLIP={flip_err:.4f}"
 
 
+def quality_label_bc6h(title: str, img_rgb: np.ndarray, original_rgb: np.ndarray) -> str:
+    """BC6H variant: PSNR in the half-int domain, HDR-FLIP on linear RGB."""
+    psnr = bc6h.hdr_psnr(img_rgb, original_rgb)
+    flip_err = compute_flip_hdr(original_rgb, img_rgb)
+    return f"{title}\nPSNR(half-int)={psnr:.2f}dB  HDR-FLIP={flip_err:.4f}"
+
+
+def compute_flip_hdr(a_rgb: np.ndarray, b_rgb: np.ndarray) -> float:
+    try:
+        import flip_evaluator as flip
+    except ImportError:
+        return float("nan")
+    _, mean_flip, _ = flip.evaluate(a_rgb.astype(np.float32), b_rgb.astype(np.float32), "HDR")
+    return float(mean_flip)
+
+
 def normal_map_rgb01(rg: np.ndarray) -> np.ndarray:
     """(H,W,2) uint8 RG -> (H,W,3) float32 RGB in [0,1] with reconstructed Z."""
     return bc5.rg_to_rgb(rg.astype(np.float32) / 255.0)
@@ -293,7 +349,7 @@ def normal_map_rgb8(rg: np.ndarray) -> np.ndarray:
 
 
 def load_models(model_paths: list[Path], device: torch.device) -> dict[str, tuple[torch.nn.Module, str]]:
-    """Load BC7 checkpoints into a {mode: (model, arch)} dict and warm them up."""
+    """Load BC7 / BC6H checkpoints into a {mode: (model, arch)} dict and warm them up."""
     models = {}
     for p in model_paths:
         model, mode, arch = load_model(p, device)
@@ -306,14 +362,35 @@ def load_models(model_paths: list[Path], device: torch.device) -> dict[str, tupl
 
 class CompareApp(SyncedViewer):
     def __init__(
-        self, image_path: Path, model_paths: list[Path], device_str: str, refine_iters: int = REFINE_ITERS, bc5: bool = False
+        self,
+        image_path: Path,
+        model_paths: list[Path],
+        device_str: str,
+        refine_iters: int = REFINE_ITERS,
+        bc5: bool = False,
+        is_bc6h: bool = False,
     ):
         self.device = torch.device(device_str)
-        self.rgba = load_rgba(image_path)
+        self.rgba = load_image(image_path)
         self.models = load_models(model_paths, self.device) if model_paths else {}
         self.neural_img, self.neural_time = None, None
 
-        if bc5:
+        if is_bc6h:
+            # HDR: score in the half-int domain, display tone-mapped.
+            model = self.models["bc6h"][0] if "bc6h" in self.models else None
+            self.ispc_img, self.ispc_time = ispc_encode_decode_bc6h(self.rgba)
+            encode_decode_bc6h(self.rgba, model, self.device, refine_iters)  # warm-up
+            self.neural_img, self.neural_time = encode_decode_bc6h(self.rgba, model, self.device, refine_iters)
+
+            h_crop, w_crop = self.ispc_img.shape[:2]
+            original = self.rgba[:h_crop, :w_crop]
+            ours = "BC6H mode 11, MLP init (experiment)" if model is not None else "anbc BC6H (min/max + refine, mode 11)"
+            panels = [
+                ("Original (tone-mapped)", bc6h.tonemap_for_display(original)),
+                (quality_label_bc6h("ISPC BC6H (full search)", self.ispc_img, original), bc6h.tonemap_for_display(self.ispc_img)),
+                (quality_label_bc6h(ours, self.neural_img, original), bc6h.tonemap_for_display(self.neural_img)),
+            ]
+        elif bc5:
             # Normal map: compare the two stored channels, display with reconstructed Z.
             self.ispc_img, self.ispc_time = ispc_encode_decode_bc5(self.rgba)
             encode_decode_bc5(self.rgba, self.device, refine_iters)  # warm-up
@@ -361,6 +438,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--bc5", action="store_true", help="compare BC5 (normal maps: R/G) instead of BC7; needs no --model")
     parser.add_argument(
+        "--bc6h",
+        action="store_true",
+        help="compare BC6H on a .hdr image (block min/max init like the C library; --model checkpoints/bc6h_mode11_mlp.pt "
+        "for the superseded MLP init)",
+    )
+    parser.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"),
     )
@@ -372,5 +455,5 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    app = CompareApp(args.image, args.model, args.device, args.refine_iters, args.bc5)
+    app = CompareApp(args.image, args.model, args.device, args.refine_iters, args.bc5, args.bc6h)
     app.show()
