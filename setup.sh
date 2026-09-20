@@ -25,7 +25,7 @@ echo "=== Downloading datasets (DIV2K + ambientCG alpha) ==="
 python src/download_datasets.py
 
 if command -v oiiotool >/dev/null 2>&1; then
-    echo "=== Converting DIV2K to HDR (BC6H experiments) ==="
+    echo "=== Converting DIV2K to HDR (BC6H / ASTC float benchmarks) ==="
     python src/convert_hdr_dataset.py
 else
     echo "oiiotool not found: skipping the HDR dataset (brew install openimageio, then python src/convert_hdr_dataset.py)"
@@ -37,5 +37,3 @@ echo "Activate with: source .venv/bin/activate  (or .venv/Scripts/activate on Wi
 echo "Then train with:"
 echo "  python src/train_bc7.py --mode mode6 --epochs 15 --batch-size 32768"
 echo "  python src/train_bc7.py --mode mode5 --epochs 60 --val-images 4 --batch-size 4096"
-echo "  python src/train_bc7.py --mode bc5 --epochs 15 --batch-size 32768   (needs data/normal, see notes.txt)"
-echo "  python src/train_bc7.py --mode bc6h --epochs 15 --batch-size 32768  (experiment, needs data/hdr)"

@@ -1,22 +1,19 @@
 """BC6H (unsigned, UF16) codec: mode-11 encoder (block min/max endpoints +
-exact-index / least-squares refinement, bit-exact packer), the superseded
-mode-11 MLP's differentiable decode, a full 14-mode reference decoder and a
-wrapper around ispc-texcomp (ground truth). Built from the same generic
-pieces as bc7_codec.
+exact-index / least-squares refinement, bit-exact packer), a full 14-mode
+reference decoder and a wrapper around ispc-texcomp (ground truth). Built
+from the same generic pieces as bc7_codec.
 
 No network, like BC5. BC6H mode 11 (single subset, 10-bit RGB endpoints,
 4-bit indices, no partition) is structurally BC7 mode 6 -- fit one 3-D line
-through the 16 pixels -- so a mode-11 MLP was trained for it
-(train_bc7.py --mode bc6h; per-block normalised input, exact-index loss).
-Its endpoints *are* better than the block's bounding box before refinement
-(43.7 vs 42.6 dB over 20 HDR validation images), but after the 2 standard
-least-squares refinement rounds both land in the same place (45.67 vs
-45.72 dB), so the shipped encoder starts from the per-channel min/max --
-what the fast GPU BC6H encoders do -- and the C library loads no model.
-`encode_bc6h_blocks(model=...)` keeps the neural init for experiments. The
-two-subset modes (32 partitions x 9 delta layouts) are out of scope, as
-they are for the BC7 side; ISPC's full mode search is ~4 dB ahead mostly
-because of the higher-precision single-subset modes 12/13.
+through the 16 pixels -- so a mode-11 MLP was tried (per-block normalised
+input, exact-index loss). Its endpoints *were* better than the block's
+bounding box before refinement (43.7 vs 42.6 dB over 20 HDR validation
+images), but after the 2 standard least-squares refinement rounds both
+landed in the same place (45.67 vs 45.72 dB), so the encoder starts from the
+per-channel min/max -- what the fast GPU BC6H encoders do -- and the network
+was removed. The two-subset modes (32 partitions x 9 delta layouts) are out
+of scope, as they are for the BC7 side; ISPC's full mode search is ~4 dB
+ahead mostly because of the higher-precision single-subset modes 12/13.
 
 Encoding domain: BC6H interpolates in the *half-float bit pattern as an
 integer* (unsigned: 0..0x7BFF = 65504.0), which is piecewise-log. Every pixel
@@ -45,13 +42,7 @@ import torch
 
 import ispc_texcomp as _it
 from bc6h_tables import FIXUP2, MODE_DESC, MODE_INFO, PARTITION2
-from bc7_codec import (
-    _WEIGHTS_4BIT,
-    _bits_from_values_2d_torch,
-    _refine_line,
-    _ste,
-    nearest_weight_index_torch,
-)
+from bc7_codec import _WEIGHTS_4BIT, _bits_from_values_2d_torch, _refine_line, nearest_weight_index_torch
 
 HALF_MAX = 0x7BFF  # largest finite positive half (65504.0) as bits
 # Integer palette weights (x64) of the 3-bit (two-subset modes) and 4-bit index sets.
@@ -86,10 +77,6 @@ def float_to_norm(v: np.ndarray) -> np.ndarray:
     return float_to_halfint(v).astype(np.float32) / HALF_MAX
 
 
-def norm_to_float(x01: np.ndarray) -> np.ndarray:
-    return halfint_to_float(np.clip(np.round(np.asarray(x01, dtype=np.float64) * HALF_MAX), 0, HALF_MAX).astype(np.int32))
-
-
 # ---------------------------------------------------------------------------
 # Endpoint quantization (what the decoder will actually see).
 # ---------------------------------------------------------------------------
@@ -112,39 +99,8 @@ def _decoded_endpoint_bc6h_torch(v01: torch.Tensor) -> torch.Tensor:
     return _decoded10_torch(_quantize10_torch(v01))
 
 
-def quantize_endpoint_bc6h_ste(v: torch.Tensor) -> torch.Tensor:
-    """Snap a [0,1] endpoint to its decoded 10-bit value (STE)."""
-    return _ste(v, _decoded_endpoint_bc6h_torch(v))
-
-
 # ---------------------------------------------------------------------------
-# Differentiable decode used to train the (superseded) network.
-# ---------------------------------------------------------------------------
-
-
-def exact_decode_bc6h(endpoint0: torch.Tensor, endpoint1: torch.Tensor, pixels: torch.Tensor) -> torch.Tensor:
-    """Quantization-aware reconstruction (10-bit endpoints with STE
-    gradients) using the *exact* per-pixel index for the predicted endpoints
-    (nearest palette weight to the pixel's projection on the line, no
-    gradient through the choice) -- the way inference uses the network: it
-    only supplies endpoints, indices are always searched exactly. Training
-    on this instead of the net's own blend factors (bc7_codec's soft-decode
-    recipe) gave endpoints that are better starting points for the
-    refinement (43.7 vs 42.3 dB before refinement).
-    endpoint0/1: (N,3), pixels: (N,16,3). Returns (N,16,3)."""
-    e0 = quantize_endpoint_bc6h_ste(endpoint0).unsqueeze(-2)  # (N,1,3)
-    e1 = quantize_endpoint_bc6h_ste(endpoint1).unsqueeze(-2)
-    with torch.no_grad():
-        d = e1 - e0
-        dd = (d * d).sum(-1, keepdim=True)
-        t = torch.where(dd > 0, ((pixels - e0) * d).sum(-1, keepdim=True) / dd.clamp_min(1e-12), torch.zeros_like(dd))
-        w = torch.as_tensor(_WEIGHTS_4BIT, dtype=t.dtype, device=t.device)
-        t = w[torch.argmin(torch.abs(t.clamp(0.0, 1.0) - w), dim=-1)].unsqueeze(-1)  # (N,16,1)
-    return e0 * (1.0 - t) + e1 * t
-
-
-# ---------------------------------------------------------------------------
-# Inference-time refinement + encoder (see bc7_codec for the rationale).
+# Refinement + encoder (see bc7_codec for the rationale).
 # ---------------------------------------------------------------------------
 
 
@@ -158,65 +114,13 @@ def refine_bc6h(
     return _refine_line(pixels, endpoint0, endpoint1, _WEIGHTS_4BIT, _decoded_endpoint_bc6h_torch, iters)
 
 
-# ---------------------------------------------------------------------------
-# The (superseded) mode-11 network: input normalisation + endpoint prediction.
-# ---------------------------------------------------------------------------
-
-
-def block_range(pixels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """(N,16,3) -> (lo (N,1), span (N,1)): the block's min over all 48
-    values and its (clamped) max - min. The network works in this per-block
-    normalised frame: HDR blocks differ by orders of magnitude in absolute
-    level (a shift in the log-like half-int domain), and a net fed absolute
-    values predicted *worse* endpoints than the plain bounding box (41.0 vs
-    42.6 dB before refinement). Normalised, the bounding box becomes the
-    identity and the net only has to learn the correction. One scalar
-    range for all channels keeps the colour line's direction intact."""
-    flat = pixels.reshape(pixels.shape[0], -1)
-    lo = flat.amin(dim=1, keepdim=True)
-    span = (flat.amax(dim=1, keepdim=True) - lo).clamp_min(1.0 / HALF_MAX)
-    return lo, span
-
-
-def model_input(pixels: torch.Tensor) -> torch.Tensor:
-    """(N,16,3) half-int-domain pixels -> the (N,64) network input: the block
-    normalised to its own [min, max] (block_range), as 16 x RGBA with A = 0
-    so the net has the BC7 mode-6 geometry (and the C library's kernels need
-    no new plumbing)."""
-    lo, span = block_range(pixels)
-    norm = (pixels - lo[:, :, None]) / span[:, :, None]
-    return torch.cat([norm, torch.zeros_like(norm[..., :1])], dim=-1).reshape(pixels.shape[0], 64)
-
-
-def denormalize_endpoints(
-    pixels: torch.Tensor, e0n: torch.Tensor, e1n: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Network endpoints (N,3) in the block's normalised frame -> half-int domain."""
-    lo, span = block_range(pixels)
-    return lo + e0n * span, lo + e1n * span
-
-
-def predict_endpoints(model: torch.nn.Module, pixels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Run the mode-11 network on (N,16,3) pixels. Returns (e0, e1, interp)
-    with the endpoints back in the half-int domain."""
-    e0n, e1n, interp = model(model_input(pixels))
-    e0, e1 = denormalize_endpoints(pixels, e0n, e1n)
-    return e0, e1, interp
-
-
 @torch.no_grad()
-def encode_bc6h_blocks(
-    pixels: torch.Tensor, model: torch.nn.Module | None = None, iters: int = 2
-) -> tuple[torch.Tensor, torch.Tensor]:
+def encode_bc6h_blocks(pixels: torch.Tensor, iters: int = 2) -> tuple[torch.Tensor, torch.Tensor]:
     """The BC6H encoder: pixels (N,16,3) in the half-int domain -> (packed
     (N,16) uint8 on-device, recon (N,16,3)). Endpoints start at the block's
     per-channel min/max (bounding-box diagonal; this is what the GPU kernel
-    does) -- or at the superseded mode-11 network's prediction when `model`
-    is given -- and go through `iters` refinement rounds (see refine_bc6h)."""
-    if model is None:
-        e0, e1 = pixels.amin(dim=1), pixels.amax(dim=1)
-    else:
-        e0, e1, _ = predict_endpoints(model, pixels)
+    does) and go through `iters` refinement rounds (see refine_bc6h)."""
+    e0, e1 = pixels.amin(dim=1), pixels.amax(dim=1)
     e0, e1, interp, recon = refine_bc6h(pixels, e0, e1, iters)
     return pack_mode11_blocks_batch_torch_arr(e0, e1, interp), recon
 
@@ -249,10 +153,6 @@ def pack_mode11_blocks_batch_torch_arr(
     bits = torch.cat([mode_bits, endpoint_bits, anchor_bits, rest_bits], dim=1)  # (N,128)
     byte_weights = (1 << torch.arange(8, device=device, dtype=torch.int32))
     return (bits.reshape(n, 16, 8).to(torch.int32) * byte_weights).sum(dim=-1).to(torch.uint8)
-
-
-def pack_mode11_blocks_batch_torch(endpoint0: torch.Tensor, endpoint1: torch.Tensor, interp: torch.Tensor) -> bytes:
-    return pack_mode11_blocks_batch_torch_arr(endpoint0, endpoint1, interp).cpu().numpy().tobytes()
 
 
 # ---------------------------------------------------------------------------
@@ -403,8 +303,7 @@ def _self_test(image_path: str | None) -> None:
         print(f"ISPC BC6H on {image_path}: PSNR (half-int) {hdr_psnr(ref, rgb):.2f}dB")
 
     for name, pixels in sets.items():
-        n = pixels.shape[0]
-        packed_arr, recon = encode_bc6h_blocks(pixels, None, 2)
+        packed_arr, recon = encode_bc6h_blocks(pixels, 2)
         decoded = decode_bc6h_blocks(packed_arr.cpu().numpy()).astype(np.float64)  # (N,16,3) half bits
         recon_bits = recon.numpy().astype(np.float64) * HALF_MAX
         max_err = np.max(np.abs(decoded - recon_bits))

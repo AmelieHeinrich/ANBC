@@ -1,7 +1,6 @@
 """Visual comparison + benchmark tool: original vs ISPC vs ours (neural BC7,
-neural BC6H for .hdr images, or the network-free BC5 encoder for normal maps,
-see bc5_codec.py), with synchronized zoom/pan across panels and
-timing/quality overlays.
+or the network-free BC5 / BC6H / ASTC encoders), with synchronized zoom/pan
+across panels and timing/quality overlays.
 """
 
 from __future__ import annotations
@@ -18,30 +17,25 @@ import bc5_codec as bc5
 import bc6h_codec as bc6h
 import bc7_codec as bc7
 from data import load_image
-from model import BC5MLP, BC6HMLP, BC7Mode5MLP, BC7Mode6CNN, BC7Mode6MLP
+from model import BC7Mode5MLP, BC7Mode6MLP
 
 
-def load_model(checkpoint_path: Path, device: torch.device):
-    """Load a checkpoint saved by train_bc7.py. Returns (model, mode, arch),
-    where mode is 'mode6', 'mode5', 'bc6h' or 'bc5' (older checkpoints saved
-    before mode5 existed default to 'mode6' for backward compatibility)."""
+def load_model(checkpoint_path: Path, device: torch.device) -> tuple[torch.nn.Module, str]:
+    """Load a checkpoint saved by train_bc7.py. Returns (model, mode), where
+    mode is 'mode6' or 'mode5' (older checkpoints saved before mode5 existed
+    default to 'mode6' for backward compatibility)."""
     ckpt = torch.load(checkpoint_path, map_location=device)
     mode = ckpt.get("mode", "mode6")
-    arch = ckpt["arch"]
     hidden_dim = ckpt["hidden_dim"]
     if mode == "mode5":
         model = BC7Mode5MLP(hidden_dim=hidden_dim)
-    elif mode == "bc5":
-        model = BC5MLP(hidden_dim=hidden_dim)
-    elif mode == "bc6h":
-        model = BC6HMLP(hidden_dim=hidden_dim)
-    elif arch == "mlp":
+    elif mode == "mode6":
         model = BC7Mode6MLP(hidden_dim=hidden_dim)
     else:
-        model = BC7Mode6CNN(hidden_channels=hidden_dim // 4)
+        raise ValueError(f"{checkpoint_path}: {mode} checkpoints are not supported (only BC7 mode6/mode5 ship a network)")
     model.load_state_dict(ckpt["model_state"])
     model.to(device).eval()
-    return model, mode, arch
+    return model, mode
 
 
 # Number of exact-index / least-squares refinement rounds applied to the
@@ -50,10 +44,9 @@ def load_model(checkpoint_path: Path, device: torch.device):
 REFINE_ITERS = 2
 
 
-def _run_mode6(model, arch: str, flat01: torch.Tensor, refine_iters: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _run_mode6(model, flat01: torch.Tensor, refine_iters: int) -> tuple[torch.Tensor, torch.Tensor]:
     """Returns (recon (N,16,4), packed_arr (N,16) uint8) for the mode6 model."""
-    model_input = flat01 if arch == "mlp" else flat01.view(-1, 4, 4, 4).permute(0, 3, 1, 2).contiguous()
-    endpoint0, endpoint1, interp = model(model_input)
+    endpoint0, endpoint1, interp = model(flat01)
     if refine_iters > 0:
         endpoint0, endpoint1, interp, recon = bc7.refine_mode6(flat01.view(-1, 16, 4), endpoint0, endpoint1, refine_iters)
     else:
@@ -108,17 +101,15 @@ def encode_decode_bc5(rgba: np.ndarray, device: torch.device, refine_iters: int 
 
 
 @torch.no_grad()
-def encode_decode_bc6h(
-    rgb: np.ndarray, model: torch.nn.Module | None, device: torch.device, refine_iters: int = REFINE_ITERS
-) -> tuple[np.ndarray, float]:
-    """BC6H-encode a float RGB image (bc6h_codec.encode_bc6h_blocks: the
-    mode-11 network's endpoints, or the block min/max when `model` is None,
-    plus refinement) and decode back. Returns ((h_crop, w_crop, 3) float32, encode_seconds)."""
+def encode_decode_bc6h(rgb: np.ndarray, device: torch.device, refine_iters: int = REFINE_ITERS) -> tuple[np.ndarray, float]:
+    """BC6H-encode a float RGB image (bc6h_codec.encode_bc6h_blocks: block
+    min/max + refinement, no network) and decode back.
+    Returns ((h_crop, w_crop, 3) float32, encode_seconds)."""
     blocks, h_crop, w_crop = _tile_blocks(bc6h.float_to_norm(rgb), 3)
     flat = torch.from_numpy(blocks).to(device)
 
     t0 = time.perf_counter()
-    packed_arr, _ = bc6h.encode_bc6h_blocks(flat.view(-1, 16, 3), model, refine_iters)
+    packed_arr, _ = bc6h.encode_bc6h_blocks(flat.view(-1, 16, 3), refine_iters)
     packed_bytes = packed_arr.cpu().numpy().tobytes()
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -155,14 +146,14 @@ def ispc_encode_decode_bc5(rgba: np.ndarray) -> tuple[np.ndarray, float]:
 
 @torch.no_grad()
 def neural_encode_decode(
-    models: dict[str, tuple[torch.nn.Module, str]],
+    models: dict[str, torch.nn.Module],
     rgba: np.ndarray,
     device: torch.device,
     refine_iters: int = REFINE_ITERS,
 ) -> tuple[np.ndarray, float]:
     """Run the loaded neural model(s) over every 4x4 block of `rgba`.
 
-    `models` maps mode name ('mode6'/'mode5') to (model, arch) for however
+    `models` maps mode name ('mode6'/'mode5') to the model for however
     many modes were loaded. If both are present, this does real per-block
     *mode selection*: each block is reconstructed with both, the one with
     lower L1 error against the original block wins (mirroring how a real
@@ -189,11 +180,9 @@ def neural_encode_decode(
     with torch.no_grad():
         results = {}
         if "mode6" in models:
-            model, arch = models["mode6"]
-            results["mode6"] = _run_mode6(model, arch, flat, refine_iters)
+            results["mode6"] = _run_mode6(models["mode6"], flat, refine_iters)
         if "mode5" in models:
-            model, _ = models["mode5"]
-            results["mode5"] = _run_mode5(model, flat, refine_iters)
+            results["mode5"] = _run_mode5(models["mode5"], flat, refine_iters)
 
         if len(results) == 2:
             recon6, packed6 = results["mode6"]
@@ -218,7 +207,7 @@ def neural_encode_decode(
     return out, encode_time
 
 
-def warmup_model(models: dict[str, tuple[torch.nn.Module, str]], device: torch.device, num_iters: int = 3) -> None:
+def warmup_model(models: dict[str, torch.nn.Module], device: torch.device, num_iters: int = 3) -> None:
     """Run a few dummy batches through the model(s) + GPU bit-packer before
     timing anything for real. The first CUDA call in a process pays a
     one-time cuDNN/kernel JIT + context-init cost (seen empirically as
@@ -228,14 +217,9 @@ def warmup_model(models: dict[str, tuple[torch.nn.Module, str]], device: torch.d
     with torch.no_grad():
         for _ in range(num_iters):
             if "mode6" in models:
-                model, arch = models["mode6"]
-                _run_mode6(model, arch, dummy, REFINE_ITERS)
+                _run_mode6(models["mode6"], dummy, REFINE_ITERS)
             if "mode5" in models:
-                model, _ = models["mode5"]
-                _run_mode5(model, dummy, REFINE_ITERS)
-            if "bc6h" in models:
-                model, _ = models["bc6h"]
-                bc6h.encode_bc6h_blocks(dummy.view(-1, 16, 4)[..., :3].contiguous(), model, REFINE_ITERS)
+                _run_mode5(models["mode5"], dummy, REFINE_ITERS)
     if device.type == "cuda":
         torch.cuda.synchronize()
 
@@ -348,14 +332,12 @@ def normal_map_rgb8(rg: np.ndarray) -> np.ndarray:
     return np.clip(np.round(normal_map_rgb01(rg) * 255.0), 0, 255).astype(np.uint8)
 
 
-def load_models(model_paths: list[Path], device: torch.device) -> dict[str, tuple[torch.nn.Module, str]]:
-    """Load BC7 / BC6H checkpoints into a {mode: (model, arch)} dict and warm them up."""
+def load_models(model_paths: list[Path], device: torch.device) -> dict[str, torch.nn.Module]:
+    """Load BC7 checkpoints into a {mode: model} dict and warm them up."""
     models = {}
     for p in model_paths:
-        model, mode, arch = load_model(p, device)
-        if mode == "bc5":
-            raise ValueError(f"{p}: BC5 needs no network (pass --bc5 instead of a checkpoint)")
-        models[mode] = (model, arch)
+        model, mode = load_model(p, device)
+        models[mode] = model
     warmup_model(models, device)
     return models
 
@@ -369,26 +351,62 @@ class CompareApp(SyncedViewer):
         refine_iters: int = REFINE_ITERS,
         bc5: bool = False,
         is_bc6h: bool = False,
+        astc_variant: str | None = None,
     ):
         self.device = torch.device(device_str)
         self.rgba = load_image(image_path)
         self.models = load_models(model_paths, self.device) if model_paths else {}
         self.neural_img, self.neural_time = None, None
 
-        if is_bc6h:
+        if astc_variant:
+            # ASTC 4x4 vs the vendored astcenc CLI (-medium). Same scoring /
+            # display rules as the BCn panels: game on RGB(A), normal on the
+            # two stored channels with Z reconstructed, float half-int + tone-mapped.
+            import astc_codec as astc
+
+            self.ispc_img, self.ispc_time = astc.astcenc_encode_decode(astc_variant, image_path)
+            astc.encode_image(astc_variant, self.rgba, self.device, refine_iters)  # warm-up
+            _, self.neural_img, chosen, w_crop, h_crop, self.neural_time = astc.encode_image(
+                astc_variant, self.rgba, self.device, refine_iters)
+            self.ispc_img = self.ispc_img[:h_crop, :w_crop]
+            configs = astc.VARIANT_CONFIGS[astc_variant]
+            share = ", ".join(f"{c.name} {100 * np.mean(chosen == i):.0f}%" for i, c in enumerate(configs))
+            ours = f"anbc ASTC 4x4 {astc_variant} (min/max + refine; {share})"
+            ref = "astcenc -medium"
+            if astc_variant == "float":
+                original = self.rgba[:h_crop, :w_crop]
+                panels = [
+                    ("Original (tone-mapped)", bc6h.tonemap_for_display(original)),
+                    (quality_label_bc6h(ref, self.ispc_img, original), bc6h.tonemap_for_display(self.ispc_img)),
+                    (quality_label_bc6h(ours, self.neural_img, original), bc6h.tonemap_for_display(self.neural_img)),
+                ]
+            elif astc_variant == "normal":
+                original = self.rgba[:h_crop, :w_crop, :2]
+                panels = [
+                    ("Original", normal_map_rgb8(original)),
+                    (quality_label_bc5(ref + " (-normal)", self.ispc_img, original), normal_map_rgb8(self.ispc_img)),
+                    (quality_label_bc5(ours, self.neural_img, original), normal_map_rgb8(self.neural_img)),
+                ]
+            else:
+                original = self.rgba[:h_crop, :w_crop, :3]
+                panels = [
+                    ("Original", original),
+                    (quality_label(ref, self.ispc_img[..., :3], original), self.ispc_img[..., :3]),
+                    (quality_label(ours, self.neural_img[..., :3], original), self.neural_img[..., :3]),
+                ]
+        elif is_bc6h:
             # HDR: score in the half-int domain, display tone-mapped.
-            model = self.models["bc6h"][0] if "bc6h" in self.models else None
             self.ispc_img, self.ispc_time = ispc_encode_decode_bc6h(self.rgba)
-            encode_decode_bc6h(self.rgba, model, self.device, refine_iters)  # warm-up
-            self.neural_img, self.neural_time = encode_decode_bc6h(self.rgba, model, self.device, refine_iters)
+            encode_decode_bc6h(self.rgba, self.device, refine_iters)  # warm-up
+            self.neural_img, self.neural_time = encode_decode_bc6h(self.rgba, self.device, refine_iters)
 
             h_crop, w_crop = self.ispc_img.shape[:2]
             original = self.rgba[:h_crop, :w_crop]
-            ours = "BC6H mode 11, MLP init (experiment)" if model is not None else "anbc BC6H (min/max + refine, mode 11)"
             panels = [
                 ("Original (tone-mapped)", bc6h.tonemap_for_display(original)),
                 (quality_label_bc6h("ISPC BC6H (full search)", self.ispc_img, original), bc6h.tonemap_for_display(self.ispc_img)),
-                (quality_label_bc6h(ours, self.neural_img, original), bc6h.tonemap_for_display(self.neural_img)),
+                (quality_label_bc6h("anbc BC6H (min/max + refine, mode 11)", self.neural_img, original),
+                 bc6h.tonemap_for_display(self.neural_img)),
             ]
         elif bc5:
             # Normal map: compare the two stored channels, display with reconstructed Z.
@@ -420,7 +438,7 @@ class CompareApp(SyncedViewer):
 
         super().__init__(
             panels,
-            f"ISPC encode: {self.ispc_time * 1000:.2f}ms"
+            f"{'astcenc' if astc_variant else 'ISPC'} encode: {self.ispc_time * 1000:.2f}ms"
             + (f"   |   Neural encode: {self.neural_time * 1000:.2f}ms" if self.neural_time else ""),
         )
 
@@ -437,12 +455,9 @@ if __name__ == "__main__":
         "to enable real per-block mode selection between mode6 and mode5.",
     )
     parser.add_argument("--bc5", action="store_true", help="compare BC5 (normal maps: R/G) instead of BC7; needs no --model")
-    parser.add_argument(
-        "--bc6h",
-        action="store_true",
-        help="compare BC6H on a .hdr image (block min/max init like the C library; --model checkpoints/bc6h_mode11_mlp.pt "
-        "for the superseded MLP init)",
-    )
+    parser.add_argument("--bc6h", action="store_true", help="compare BC6H on a .hdr image; needs no --model")
+    parser.add_argument("--astc", choices=["game", "normal", "float"], default=None,
+                        help="compare ASTC 4x4 of this texture kind against astcenc; needs no --model")
     parser.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"),
@@ -455,5 +470,5 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    app = CompareApp(args.image, args.model, args.device, args.refine_iters, args.bc5, args.bc6h)
+    app = CompareApp(args.image, args.model, args.device, args.refine_iters, args.bc5, args.bc6h, args.astc)
     app.show()

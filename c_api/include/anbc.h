@@ -15,8 +15,8 @@ extern "C" {
 #endif
 
 typedef enum anbcDeviceBackend {
-    ANBC_DEVICE_BACKEND_CPU,
-    ANBC_DEVICE_BACKEND_METAL
+    ANBC_DEVICE_BACKEND_METAL, /* macOS: Metal 4 (the shipping backend on Apple platforms) */
+    ANBC_DEVICE_BACKEND_VULKAN /* Windows / Linux (also runs on MoltenVK for testing) */
 } anbcDeviceBackend;
 
 typedef enum anbcTextureFormat {
@@ -24,8 +24,11 @@ typedef enum anbcTextureFormat {
     ANBC_TEXTURE_FORMAT_BC5, /* R and G of the source (normal maps); B/A are ignored. No network. */
     ANBC_TEXTURE_FORMAT_BC6H, /* BC6H_UF16 (unsigned HDR RGB, mode 11): negative inputs clamp to 0,
                                * alpha is ignored. No network. */
-    // ANBC_TEXTURE_FORMAT_ASTC_4x4_UNORM,
-    // ANBC_TEXTURE_FORMAT_ASTC_4x4_FLOAT
+    ANBC_TEXTURE_FORMAT_ASTC_4x4_UNORM, /* ASTC 4x4 LDR (RGBA). Game textures: albedo, packed metal/roughness,
+                                         * emissive, with or without alpha. With ANBC_TEXTURE_FLAG_NORMAL_MAP the
+                                         * source's R,G (X,Y) are stored as luminance + alpha: sample .ra. */
+    ANBC_TEXTURE_FORMAT_ASTC_4x4_FLOAT  /* ASTC 4x4 HDR RGB: negative inputs clamp to 0, alpha is ignored and
+                                         * decodes as 1.0. Needs an HDR-capable ASTC decoder (Apple GPUs from A13/M1). */
 } anbcTextureFormat;
 
 /* Layout of the source pixels handed to anbcCreateTexture. Any texture format
@@ -49,7 +52,8 @@ typedef enum anbcResult {
 
 enum {
     ANBC_TEXTURE_FLAG_SRGB          = 1 << 0, /* mip filtering happens in linear light */
-    ANBC_TEXTURE_FLAG_GENERATE_MIPS = 1 << 1  /* build the full chain down to 1x1 on the GPU */
+    ANBC_TEXTURE_FLAG_GENERATE_MIPS = 1 << 1, /* build the full chain down to 1x1 on the GPU */
+    ANBC_TEXTURE_FLAG_NORMAL_MAP    = 1 << 2  /* ASTC_4x4_UNORM: X,Y from R,G -> luminance + alpha (see above) */
 };
 
 typedef struct anbcTextureDesc {
@@ -69,17 +73,17 @@ enum {
 
 typedef struct anbcCompressOptions {
     /* Rounds of least-squares endpoint refinement applied on top of the
-     * initial endpoints (the networks' for BC7, the block min/max for BC5
-     * and BC6H; indices are always chosen exactly). 0 keeps the initial endpoints
-     * as-is. Default 2; costs almost nothing. */
+     * initial endpoints (the networks' for BC7, the block min/max for
+     * BC5 / BC6H / ASTC; indices are always chosen exactly). 0 keeps the
+     * initial endpoints as-is. Default 2; costs almost nothing. */
     uint32_t refineIterations;
     uint32_t flags; /* ANBC_COMPRESS_FLAG_* */
 } anbcCompressOptions;
 
 typedef struct anbcDeviceInfo {
     const char* name;      /* GPU name, owned by the device */
-    int         metal4;    /* backend uses the Metal 4 API */
-    int         tensorOps; /* MLP inference runs on the tensor accelerators (M5+) */
+    const char* backend;   /* "Metal 4" or "Vulkan" */
+    int         tensorOps; /* MLP inference runs on the tensor accelerators (Metal, M5+) */
 } anbcDeviceInfo;
 
 typedef struct anbcMipInfo {
@@ -94,15 +98,16 @@ typedef struct anbcMipInfo {
 typedef struct anbcDevice anbcDevice;
 typedef struct anbcTexture anbcTexture;
 
-/* Returns NULL if the backend is unavailable on this machine. */
+/* Returns NULL if the backend is unavailable on this machine (not compiled
+ * in, no capable GPU, or -- Vulkan -- no loader library found). */
 anbcDevice* anbcCreateDevice(anbcDeviceBackend backend);
 void        anbcDestroyDevice(anbcDevice* device);
 void        anbcGetDeviceInfo(const anbcDevice* device, anbcDeviceInfo* outInfo);
 
 /* Load one network exported by src/export_weights.py. BC7 needs two calls:
  * the mode-6 and the mode-5 network (the file records which one it is).
- * BC5 and BC6H are encoded analytically (block min/max + refinement) and
- * need no model; passing them here returns ANBC_ERROR_UNSUPPORTED. */
+ * BC5, BC6H and ASTC are encoded analytically (block min/max + refinement)
+ * and need no model; passing them here returns ANBC_ERROR_UNSUPPORTED. */
 anbcResult anbcLoadModel(anbcDevice* device, anbcTextureFormat format, const char* path);
 
 anbcTexture* anbcCreateTexture(anbcDevice* device, const anbcTextureDesc* desc);
@@ -110,7 +115,7 @@ void         anbcDestroyTexture(anbcTexture* texture);
 
 /* Generates mips (if requested at creation) and compresses every level.
  * `options` may be NULL for defaults. Blocking. BC7 needs both networks
- * loaded first; BC5 and BC6H work right after anbcCreateDevice. */
+ * loaded first; BC5, BC6H and ASTC work right after anbcCreateDevice. */
 anbcResult anbcCompress(anbcDevice* device, anbcTexture* texture, anbcTextureFormat format,
                         const anbcCompressOptions* options);
 

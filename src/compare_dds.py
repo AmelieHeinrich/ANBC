@@ -1,17 +1,21 @@
-"""Score and view the BC7 / BC5 / BC6H .dds files written by c_api/build/anbc_compare.
+"""Score and view the BC7 / BC5 / BC6H / ASTC .dds (and .astc) files written
+by c_api/build/anbc_compare.
 
 For every <stem>_anbc.dds / <stem>_cmp.dds pair in --dds-folder whose original
 <stem>.<ext> exists in --original-folder, every mip level is decoded
-(texture2ddecoder, an independent decoder; our own all-mode decoder for BC6H)
-and compared against a CPU box-filtered reference chain of the original (same
-2x2 filter the encoders used; pass --srgb if the DDS were generated with
---srgb). The format is read from the DDS header: BC7 is scored on RGB (and
-RGBA), BC5 on the two stored channels and viewed as a normal map with Z
-reconstructed, BC6H (originals are .hdr) in the half-int domain and viewed
-tone-mapped.
+(texture2ddecoder, an independent decoder; our own all-mode decoder for BC6H;
+the astcenc CLI for HDR ASTC) and compared against a CPU box-filtered
+reference chain of the original (same 2x2 filter the encoders used; pass
+--srgb if the DDS were generated with --srgb). The format is read from the
+DDS header: BC7 and ASTC are scored on RGB (and RGBA), BC5 -- and ASTC with
+--normal-map, whose X,Y live in the decoded R and A -- on the two stored
+channels and viewed as a normal map with Z reconstructed, BC6H and HDR ASTC
+(originals are .hdr; the latter comes as <stem>_anbc.astc + _mipN.astc
+since DDS has no HDR ASTC id) in the half-int domain and viewed tone-mapped.
 
     python src/compare_dds.py --dds-folder out/bistro --original-folder data/bistro [--flip] [--csv q.csv]
     python src/compare_dds.py --dds-folder out/bistro --original-folder data/bistro --image <stem> [--mip 2]
+    python src/compare_dds.py --dds-folder out/normal --original-folder data/normal --normal-map
 """
 
 from __future__ import annotations
@@ -23,6 +27,7 @@ from pathlib import Path
 
 import numpy as np
 
+import astc_codec as astc
 import bc5_codec as bc5
 import bc6h_codec as bc6h
 import bc7_codec as bc7
@@ -42,15 +47,22 @@ IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".tga", ".bmp", ".hdr")
 DXGI_FORMAT_BC5_UNORM = 83
 DXGI_FORMAT_BC6H_UF16 = 95
 DXGI_FORMAT_BC7_UNORM = 98
+DXGI_FORMAT_ASTC_4X4_UNORM = 134
+FORMAT_ASTC_4X4_NORMAL = -134  # pseudo format: ASTC_4X4_UNORM read with --normal-map (X,Y in R,A -> RG)
+FORMAT_ASTC_4X4_HDR = -135     # pseudo format: the .astc chains of astc-float
 DDS_DX10_HEADER_SIZE = 4 + 124 + 20
 # Channels that are stored / scored per format.
-FORMAT_CHANNELS = {DXGI_FORMAT_BC7_UNORM: 3, DXGI_FORMAT_BC5_UNORM: 2, DXGI_FORMAT_BC6H_UF16: 3}
+FORMAT_CHANNELS = {DXGI_FORMAT_BC7_UNORM: 3, DXGI_FORMAT_BC5_UNORM: 2, DXGI_FORMAT_BC6H_UF16: 3,
+                   DXGI_FORMAT_ASTC_4X4_UNORM: 3, FORMAT_ASTC_4X4_NORMAL: 2, FORMAT_ASTC_4X4_HDR: 3}
+FORMAT_NAMES = {DXGI_FORMAT_BC7_UNORM: "BC7", DXGI_FORMAT_BC5_UNORM: "BC5", DXGI_FORMAT_BC6H_UF16: "BC6H",
+                DXGI_FORMAT_ASTC_4X4_UNORM: "ASTC 4x4", FORMAT_ASTC_4X4_NORMAL: "ASTC 4x4 normal map",
+                FORMAT_ASTC_4X4_HDR: "ASTC 4x4 HDR"}
 
 
-def read_dds(path: Path) -> tuple[list[np.ndarray], int]:
+def read_dds(path: Path, normal_map: bool = False) -> tuple[list[np.ndarray], int]:
     """Returns (decoded image of every mip level, DXGI format): RGBA8 for
-    BC7/BC5 (BC5 levels have R/G decoded, B = 0 and A = 255), (H, W, 3)
-    float32 linear RGB for BC6H."""
+    BC7/BC5/ASTC (BC5 and normal-map ASTC levels have R/G decoded, B = 0
+    and A = 255), (H, W, 3) float32 linear RGB for BC6H."""
     raw = path.read_bytes()
     if raw[:4] != b"DDS " or raw[84:88] != b"DX10":
         raise ValueError(f"{path}: not a DX10 DDS")
@@ -58,7 +70,11 @@ def read_dds(path: Path) -> tuple[list[np.ndarray], int]:
     mip_count = max(1, struct.unpack_from("<I", raw, 28)[0])
     dxgi_format = struct.unpack_from("<I", raw, 128)[0]
     if dxgi_format not in FORMAT_CHANNELS:
-        raise ValueError(f"{path}: DXGI format {dxgi_format} is not BC7_UNORM, BC5_UNORM or BC6H_UF16")
+        raise ValueError(f"{path}: DXGI format {dxgi_format} is not BC7_UNORM, BC5_UNORM, BC6H_UF16 or ASTC_4X4_UNORM")
+    if normal_map:
+        if dxgi_format != DXGI_FORMAT_ASTC_4X4_UNORM:
+            raise ValueError(f"{path}: --normal-map only applies to ASTC_4X4_UNORM")
+        dxgi_format = FORMAT_ASTC_4X4_NORMAL
 
     levels = []
     offset = DDS_DX10_HEADER_SIZE
@@ -69,6 +85,14 @@ def read_dds(path: Path) -> tuple[list[np.ndarray], int]:
             levels.append(bc7.decode_bc7(raw[offset : offset + size], w, h))
         elif dxgi_format == DXGI_FORMAT_BC6H_UF16:
             levels.append(bc6h.decode_bc6h(raw[offset : offset + size], w, h))
+        elif dxgi_format == DXGI_FORMAT_ASTC_4X4_UNORM:
+            levels.append(astc.decode_astc_t2d(raw[offset : offset + size], w, h))
+        elif dxgi_format == FORMAT_ASTC_4X4_NORMAL:
+            rgba = astc.decode_astc_t2d(raw[offset : offset + size], w, h)
+            rgba[..., 1] = rgba[..., 3]  # Y is stored in alpha
+            rgba[..., 2] = 0
+            rgba[..., 3] = 255
+            levels.append(rgba)
         else:
             rg = bc5.decode_bc5(raw[offset : offset + size], w, h)
             rgba = np.zeros((h, w, 4), dtype=np.uint8)
@@ -80,11 +104,29 @@ def read_dds(path: Path) -> tuple[list[np.ndarray], int]:
     return levels, dxgi_format
 
 
+def read_astc_chain(base: Path) -> tuple[list[np.ndarray], int]:
+    """<base>.astc, <base>_mip1.astc, ... (astc-float output) -> (float RGB levels, FORMAT_ASTC_4X4_HDR)."""
+    levels = []
+    path = Path(str(base) + ".astc")
+    while path.exists():
+        levels.append(astc.astcenc_decode_hdr(path))
+        path = Path(f"{base}_mip{len(levels)}.astc")
+    if not levels:
+        raise FileNotFoundError(f"{base}.astc")
+    return levels, FORMAT_ASTC_4X4_HDR
+
+
+def read_levels(folder: Path, base: str, normal_map: bool) -> tuple[list[np.ndarray], int]:
+    """Whatever anbc_compare wrote for <base>: a .dds chain, else the .astc files."""
+    dds = folder / f"{base}.dds"
+    return read_dds(dds, normal_map) if dds.exists() else read_astc_chain(folder / base)
+
+
 def to_display_rgb(img: np.ndarray, dxgi_format: int) -> np.ndarray:
-    """RGB8 for viewing / FLIP: BC5 gets its Z reconstructed, BC6H is tone-mapped."""
-    if dxgi_format == DXGI_FORMAT_BC5_UNORM:
+    """RGB8 for viewing / FLIP: BC5 / normal maps get their Z reconstructed, HDR is tone-mapped."""
+    if dxgi_format in (DXGI_FORMAT_BC5_UNORM, FORMAT_ASTC_4X4_NORMAL):
         return normal_map_rgb8(img[..., :2])
-    if dxgi_format == DXGI_FORMAT_BC6H_UF16:
+    if dxgi_format in (DXGI_FORMAT_BC6H_UF16, FORMAT_ASTC_4X4_HDR):
         return bc6h.tonemap_for_display(img)
     return img[..., :3]
 
@@ -144,20 +186,21 @@ def find_original(original_folder: Path, stem: str) -> Path | None:
     return None
 
 
-def score_folder(dds_folder: Path, original_folder: Path, srgb: bool, use_flip: bool, csv_path: Path | None) -> None:
-    stems = sorted(p.name[: -len("_anbc.dds")] for p in dds_folder.glob("*_anbc.dds"))
+def score_folder(dds_folder: Path, original_folder: Path, srgb: bool, use_flip: bool, csv_path: Path | None,
+                 normal_map: bool = False) -> None:
+    stems = sorted({p.name[: -len("_anbc.dds")] for p in dds_folder.glob("*_anbc.dds")}
+                   | {p.name[: -len("_anbc.astc")] for p in dds_folder.glob("*_anbc.astc")})
     rows = []
     print(f"{'texture':48s} {'size':>10s} {'anbc mip0':>10s} {'cmp mip0':>10s} {'anbc mips':>10s} {'cmp mips':>10s}"
           + (f" {'anbc flip':>10s} {'cmp flip':>10s}" if use_flip else ""))
     for stem in stems:
         orig_path = find_original(original_folder, stem)
-        cmp_path = dds_folder / f"{stem}_cmp.dds"
-        if orig_path is None or not cmp_path.exists():
-            print(f"{stem:48.48s}  (skipped: missing original or _cmp.dds)")
+        if orig_path is None or not ((dds_folder / f"{stem}_cmp.dds").exists() or (dds_folder / f"{stem}_cmp.astc").exists()):
+            print(f"{stem:48.48s}  (skipped: missing original or _cmp output)")
             continue
         original = load_image(orig_path)
-        anbc_levels, fmt = read_dds(dds_folder / f"{stem}_anbc.dds")
-        cmp_levels, _ = read_dds(cmp_path)
+        anbc_levels, fmt = read_levels(dds_folder, f"{stem}_anbc", normal_map)
+        cmp_levels, _ = read_levels(dds_folder, f"{stem}_cmp", normal_map)
         channels = FORMAT_CHANNELS[fmt]
         refs = reference_chain(original, max(len(anbc_levels), len(cmp_levels)), srgb)
 
@@ -178,7 +221,7 @@ def score_folder(dds_folder: Path, original_folder: Path, srgb: bool, use_flip: 
             "anbc_mean_rgb": float(np.mean(finite([p[0] for p in pa]))),
             "cmp_mean_rgb": float(np.mean(finite([p[0] for p in pc]))),
         }
-        if use_flip and fmt == DXGI_FORMAT_BC6H_UF16:
+        if use_flip and fmt in (DXGI_FORMAT_BC6H_UF16, FORMAT_ASTC_4X4_HDR):
             row["anbc_flip"] = compute_flip_hdr(original, anbc_levels[0])
             row["cmp_flip"] = compute_flip_hdr(original, cmp_levels[0])
         elif use_flip:
@@ -235,29 +278,28 @@ def score_folder(dds_folder: Path, original_folder: Path, srgb: bool, use_flip: 
         print(f"wrote {csv_path}")
 
 
-def view_image(dds_folder: Path, original_folder: Path, stem: str, mip: int, srgb: bool) -> None:
+def view_image(dds_folder: Path, original_folder: Path, stem: str, mip: int, srgb: bool, normal_map: bool = False) -> None:
     orig_path = find_original(original_folder, stem)
     if orig_path is None:
         raise SystemExit(f"no original for {stem} in {original_folder}")
-    anbc_levels, fmt = read_dds(dds_folder / f"{stem}_anbc.dds")
-    cmp_levels, _ = read_dds(dds_folder / f"{stem}_cmp.dds")
+    anbc_levels, fmt = read_levels(dds_folder, f"{stem}_anbc", normal_map)
+    cmp_levels, _ = read_levels(dds_folder, f"{stem}_cmp", normal_map)
     if mip >= len(anbc_levels):
         raise SystemExit(f"{stem} has {len(anbc_levels)} mips")
     ref = reference_chain(load_image(orig_path), mip + 1, srgb)[mip]
     a, c = anbc_levels[mip], cmp_levels[mip]
-    if fmt == DXGI_FORMAT_BC5_UNORM:
+    name = FORMAT_NAMES[fmt]
+    if fmt in (DXGI_FORMAT_BC5_UNORM, FORMAT_ASTC_4X4_NORMAL):
         label = lambda title, img: quality_label_bc5(title, img[..., :2], ref[..., :2])
-        name = "BC5"
-    elif fmt == DXGI_FORMAT_BC6H_UF16:
+    elif fmt in (DXGI_FORMAT_BC6H_UF16, FORMAT_ASTC_4X4_HDR):
         label = lambda title, img: quality_label_bc6h(title, img, ref)
-        name = "BC6H"
     else:
         label = lambda title, img: quality_label(title, img[..., :3], ref[..., :3])
-        name = "BC7"
+    reference = "astcenc" if fmt in (DXGI_FORMAT_ASTC_4X4_UNORM, FORMAT_ASTC_4X4_NORMAL, FORMAT_ASTC_4X4_HDR) else "Compressonator"
     panels = [
         (f"Original (mip {mip}, {ref.shape[1]}x{ref.shape[0]})", to_display_rgb(ref, fmt)),
-        (label(f"Compressonator {name}", c), to_display_rgb(c, fmt)),
-        (label(f"anbc neural {name}", a), to_display_rgb(a, fmt)),
+        (label(f"{reference} {name}", c), to_display_rgb(c, fmt)),
+        (label(f"anbc {name}", a), to_display_rgb(a, fmt)),
     ]
     SyncedViewer(panels, stem).show()
 
@@ -271,9 +313,11 @@ if __name__ == "__main__":
     parser.add_argument("--csv", type=Path, default=None)
     parser.add_argument("--image", default=None, help="open the synced-zoom viewer for this texture stem")
     parser.add_argument("--mip", type=int, default=0)
+    parser.add_argument("--normal-map", action="store_true",
+                        help="the ASTC DDS were made with anbc_compare --normal-map: score X,Y from the decoded R and A")
     args = parser.parse_args()
 
     if args.image:
-        view_image(args.dds_folder, args.original_folder, args.image, args.mip, args.srgb)
+        view_image(args.dds_folder, args.original_folder, args.image, args.mip, args.srgb, args.normal_map)
     else:
-        score_folder(args.dds_folder, args.original_folder, args.srgb, args.flip, args.csv)
+        score_folder(args.dds_folder, args.original_folder, args.srgb, args.flip, args.csv, args.normal_map)

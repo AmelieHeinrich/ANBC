@@ -1,0 +1,34 @@
+// Neural BC7 encoder: one thread per 4x4 block, both MLPs evaluated per
+// thread (anbc_mlp_scalar.glsl). GLSL port of anbc_bc7_scalar.metal.
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+
+#include "anbc_bc7_common.glsl"
+#include "anbc_mlp_scalar.glsl"
+
+layout(std430, set = 0, binding = 1) readonly buffer Model6Header { ModelHeader h; } uH6;
+layout(std430, set = 0, binding = 2) readonly buffer Model6Weights { vec4 w[]; } uW6;
+layout(std430, set = 0, binding = 3) readonly buffer Model5Header { ModelHeader h; } uH5;
+layout(std430, set = 0, binding = 4) readonly buffer Model5Weights { vec4 w[]; } uW5;
+
+ANBC_DEFINE_MLP(runMlp6, uH6.h, uW6.w)
+ANBC_DEFINE_MLP(runMlp5, uH5.h, uW5.w)
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+void main()
+{
+    const uvec2 gid = gl_GlobalInvocationID.xy;
+    if (gid.x >= P.blocksX || gid.y >= P.blocksY)
+        return;
+
+    vec4 px[16];
+    loadBlock(gid, px);
+
+    float y6[ANBC_MLP_MAX_OUT];
+    float y5[ANBC_MLP_MAX_OUT];
+    runMlp6(px, y6);
+    runMlp5(px, y5);
+
+    uOut.blocks[P.blockBase + gid.y * P.blocksX + gid.x] = finishBlock(px, y6, y5);
+}

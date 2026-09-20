@@ -2,26 +2,40 @@
  * @ Author: Amélie Heinrich
  * @ Copyright: Copyright (c) 2026 Amélie Heinrich. All rights reserved.
  *
- * anbc_compare: neural BC7 / BC6H / BC5 (anbc, GPU) vs AMD Compressonator
- * CMP_Core (CPU, multithreaded). Both produce the full mip chain from the same
- * source, so the timings are "RGBA in -> block chain out" for both.
+ * anbc_compare: neural BC7 / BC6H / BC5 / ASTC 4x4 (anbc, GPU) vs a CPU
+ * reference encoder, multithreaded: AMD Compressonator CMP_Core for the BCn
+ * formats, ARM astc-encoder for ASTC. Both produce the full mip chain from
+ * the same source, so the timings are "RGBA in -> block chain out" for both.
  *
- *   anbc_compare <image-or-folder> [--format bc7|bc6h|bc5] [--out DIR] [--srgb]
- *                [--cmp-quality q] [--refine-iters n] [--no-mips]
- *                [--no-tensor-ops] [--threads n] [--single-thread]
+ *   anbc_compare <image-or-folder> [--format bc7|bc6h|bc5|astc|astc-float]
+ *                [--backend metal|vulkan] [--xcheck] [--normal-map] [--out DIR] [--srgb] [--cmp-quality q]
+ *                [--astc-preset fast|medium|thorough] [--refine-iters n]
+ *                [--no-mips] [--no-tensor-ops] [--threads n] [--single-thread]
  *
- * BC6H takes .hdr (Radiance) inputs, uploaded as RGBA16F; an 8-bit image is
- * converted to half [0,1] instead. Its PSNR is measured in the half-int
- * domain (half bit pattern / 0x7BFF, ~relative error), see src/bc6h_codec.py.
+ * BC6H and astc-float take .hdr (Radiance) inputs, uploaded as RGBA16F; an
+ * 8-bit image is converted to half [0,1] instead. Their PSNR is measured in
+ * the half-int domain (half bit pattern / 0x7BFF, ~relative error), see
+ * src/bc6h_codec.py. --normal-map (astc only) stores the source's R,G as
+ * luminance + alpha (ANBC_TEXTURE_FLAG_NORMAL_MAP) and scores those two
+ * channels like BC5.
  *
- * Single image: also decodes both results with Compressonator's decoder (an
+ * --xcheck (single image, macOS): encodes with the Metal *and* the Vulkan
+ * backend and reports each one's PSNR plus the share of bit-identical
+ * blocks per mip. Metal compiles with fast math, so the two are expected to
+ * agree to within a few hundredths of a dB, not bit for bit.
+ *
+ * Single image: also decodes both results with the reference's decoder (an
  * independent third-party decoder, so it doubles as a bitstream check) and
- * prints PSNR against the source (RGB for BC7/BC6H, the two stored channels
- * for BC5), plus anbc's mips against a CPU box-filtered reference chain.
+ * prints PSNR against the source (RGB for BC7/BC6H/ASTC, the two stored
+ * channels for BC5 / normal maps), plus anbc's mips against a CPU
+ * box-filtered reference chain.
  *
  * Folder: writes <stem>_anbc.dds and <stem>_cmp.dds (full chains) for every
- * image into --out, prints timings, and writes summary.csv. Quality scoring of
- * a folder is done by src/compare_dds.py.
+ * image into --out, prints timings, and writes summary.csv. ASTC formats
+ * additionally write <stem>_anbc.astc / <stem>_cmp.astc (mip 0; further
+ * levels as <stem>_anbc_mipN.astc), and astc-float writes only those since
+ * DDS has no HDR ASTC format. Quality scoring of a folder is done by
+ * src/compare_dds.py.
  */
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -33,6 +47,7 @@
 #include "stb_image.h"
 
 #include "anbc.h"
+#include "astcenc.h"
 #include "cmp_core.h"
 #include "dds.h"
 
@@ -84,24 +99,72 @@ static inline double halfIntNorm(uint16_t h)
 struct Format {
     anbcTextureFormat anbc;
     const char*       name;
-    const char*       modelFiles[3]; /* NULL-terminated */
+    const char*       modelFiles[3]; /* NULL-terminated; only BC7 loads networks */
     bool              tensorKernel;  /* has a tensor-ops variant worth A/B-ing */
     bool              hdr;           /* RGBA16F source, PSNR in the half-int domain */
-    uint32_t          dxgi;
+    uint32_t          dxgi;          /* 0: no DDS output */
     int               channels;      /* channels that are stored / scored */
     const char*       psnrLabel;
     double            floorMip0, floorMips; /* single-image sanity floors (dB) */
+    bool              astc;          /* reference = astcenc */
 };
 
 static const Format kFormatBC7 = { ANBC_TEXTURE_FORMAT_BC7, "BC7", { "bc7_mode6.bin", "bc7_mode5.bin", NULL }, true, false,
-                                   DDS_DXGI_FORMAT_BC7_UNORM, 3, "PSNR RGB", 25.0, 20.0 };
+                                   DDS_DXGI_FORMAT_BC7_UNORM, 3, "PSNR RGB", 25.0, 20.0, false };
 static const Format kFormatBC6H = { ANBC_TEXTURE_FORMAT_BC6H, "BC6H", { NULL, NULL, NULL }, false, true,
-                                    DDS_DXGI_FORMAT_BC6H_UF16, 3, "PSNR half-int", 30.0, 25.0 };
+                                    DDS_DXGI_FORMAT_BC6H_UF16, 3, "PSNR half-int", 30.0, 25.0, false };
 static const Format kFormatBC5 = { ANBC_TEXTURE_FORMAT_BC5, "BC5", { NULL, NULL, NULL }, false, false,
-                                   DDS_DXGI_FORMAT_BC5_UNORM, 2, "PSNR RG", 25.0, 20.0 };
+                                   DDS_DXGI_FORMAT_BC5_UNORM, 2, "PSNR RG", 25.0, 20.0, false };
+static const Format kFormatASTC = { ANBC_TEXTURE_FORMAT_ASTC_4x4_UNORM, "ASTC 4x4", { NULL, NULL, NULL }, false, false,
+                                    DDS_DXGI_FORMAT_ASTC_4X4_UNORM, 3, "PSNR RGB", 25.0, 20.0, true };
+/* --normal-map: the same format scored on the two stored channels (X from L, Y from A). */
+static const Format kFormatASTCNormal = { ANBC_TEXTURE_FORMAT_ASTC_4x4_UNORM, "ASTC 4x4 normal map", { NULL, NULL, NULL },
+                                          false, false, DDS_DXGI_FORMAT_ASTC_4X4_UNORM, 2, "PSNR XY", 25.0, 20.0, true };
+static const Format kFormatASTCFloat = { ANBC_TEXTURE_FORMAT_ASTC_4x4_FLOAT, "ASTC 4x4 HDR", { NULL, NULL, NULL }, false, true,
+                                         0, 3, "PSNR half-int", 30.0, 25.0, true };
 
-/* Decode a block image with Compressonator into (w, h, 4) RGBA8, or RGBA
- * half for BC6H (A = 1.0). BC5 fills R and G; B = 0, A = 255. */
+/* ------------------------------------------------------------------------- */
+/* astcenc (reference encoder + decoder for the ASTC formats)                */
+/* ------------------------------------------------------------------------- */
+
+static float gAstcPreset = ASTCENC_PRE_MEDIUM;
+static const char* gAstcPresetName = "medium";
+
+/* One context per (profile, normal map, decode-only, thread count), reused
+ * across images/levels so its setup cost stays out of the timings. */
+static astcenc_context* astcContext(const Format& fmt, unsigned threads, bool decodeOnly)
+{
+    static astcenc_context* cache[2][2][2] = {}; /* [hdr][normal][decodeOnly] */
+    static unsigned cachedThreads[2][2][2] = {};
+    const int hdr = fmt.hdr ? 1 : 0, normal = fmt.channels == 2 ? 1 : 0, dec = decodeOnly ? 1 : 0;
+    astcenc_context*& ctx = cache[hdr][normal][dec];
+    if (ctx && cachedThreads[hdr][normal][dec] != threads) {
+        astcenc_context_free(ctx);
+        ctx = NULL;
+    }
+    if (!ctx) {
+        astcenc_config cfg;
+        unsigned flags = decodeOnly ? ASTCENC_FLG_DECOMPRESS_ONLY : 0;
+        if (!fmt.hdr)
+            flags |= ASTCENC_FLG_USE_DECODE_UNORM8; /* the exact top-8-bits decode our decoder implements */
+        if (normal && !decodeOnly)
+            flags |= ASTCENC_FLG_MAP_NORMAL;
+        const astcenc_profile profile = fmt.hdr ? ASTCENC_PRF_HDR_RGB_LDR_A : ASTCENC_PRF_LDR;
+        astcenc_error err = astcenc_config_init(profile, 4, 4, 1, gAstcPreset, flags, &cfg);
+        if (err == ASTCENC_SUCCESS)
+            err = astcenc_context_alloc(&cfg, threads, &ctx, NULL);
+        if (err != ASTCENC_SUCCESS) {
+            fprintf(stderr, "astcenc: %s\n", astcenc_get_error_string(err));
+            ctx = NULL;
+        }
+        cachedThreads[hdr][normal][dec] = threads;
+    }
+    return ctx;
+}
+
+/* Decode a block image with the reference decoder (Compressonator for BCn,
+ * astcenc for ASTC) into (w, h, 4) RGBA8, or RGBA half for the HDR formats
+ * (A = 1.0). BC5 and ASTC normal maps fill R and G; B = 0, A = 255. */
 static Image decodeBlocks(const Format& fmt, const void* blocks, uint32_t w, uint32_t h)
 {
     Image out;
@@ -113,6 +176,19 @@ static Image decodeBlocks(const Format& fmt, const void* blocks, uint32_t w, uin
     else
         out.rgba.resize((size_t)w * h * 4);
     const uint32_t bx = (w + 3) / 4, by = (h + 3) / 4;
+    if (fmt.astc) {
+        astcenc_context* ctx = astcContext(fmt, 1, true);
+        void* slice = fmt.hdr ? (void*)out.half.data() : (void*)out.rgba.data();
+        astcenc_image img = { w, h, 1, fmt.hdr ? ASTCENC_TYPE_F16 : ASTCENC_TYPE_U8, &slice };
+        /* normal maps: X is in L (-> R), Y in A (-> G) */
+        const astcenc_swizzle swz = fmt.channels == 2 ? astcenc_swizzle{ ASTCENC_SWZ_R, ASTCENC_SWZ_A, ASTCENC_SWZ_0, ASTCENC_SWZ_1 }
+                                                      : astcenc_swizzle{ ASTCENC_SWZ_R, ASTCENC_SWZ_G, ASTCENC_SWZ_B, ASTCENC_SWZ_A };
+        astcenc_decompress_reset(ctx);
+        const astcenc_error err = astcenc_decompress_image(ctx, (const uint8_t*)blocks, (size_t)bx * by * 16, &img, &swz, 0);
+        if (err != ASTCENC_SUCCESS)
+            fprintf(stderr, "astcenc decode: %s\n", astcenc_get_error_string(err));
+        return out;
+    }
     const uint8_t* src = (const uint8_t*)blocks;
     for (uint32_t y = 0; y < by; y++) {
         for (uint32_t x = 0; x < bx; x++) {
@@ -288,8 +364,8 @@ struct Level {
     std::vector<uint8_t> blocks;
 };
 
-/* Compressonator: CPU mips + every level, blocks of a level split into row
- * ranges across `threads` worker threads. */
+/* Compressonator (BCn) or astcenc (ASTC): CPU mips + every level, the work
+ * of a level split across `threads` worker threads. */
 static std::vector<Level> encodeCmpChain(const Format& fmt, const Image& src, bool mips, bool srgb, unsigned threads,
                                          float quality)
 {
@@ -301,6 +377,36 @@ static std::vector<Level> encodeCmpChain(const Format& fmt, const Image& src, bo
         const uint32_t w = level.w, h = level.h;
         const uint32_t bx = (w + 3) / 4, by = (h + 3) / 4;
         Level L = { w, h, std::vector<uint8_t>((size_t)bx * by * 16) };
+
+        if (fmt.astc) {
+            /* astcenc splits the image across its own thread indices. */
+            const unsigned n = (bx * by < 256) ? 1 : threads;
+            astcenc_context* ctx = astcContext(fmt, n, false);
+            void* slice = fmt.hdr ? (void*)level.half.data() : (void*)level.rgba.data();
+            astcenc_image img = { w, h, 1, fmt.hdr ? ASTCENC_TYPE_F16 : ASTCENC_TYPE_U8, &slice };
+            const astcenc_swizzle swz = fmt.channels == 2 ? astcenc_swizzle{ ASTCENC_SWZ_R, ASTCENC_SWZ_R, ASTCENC_SWZ_R, ASTCENC_SWZ_G }
+                                                          : astcenc_swizzle{ ASTCENC_SWZ_R, ASTCENC_SWZ_G, ASTCENC_SWZ_B, ASTCENC_SWZ_A };
+            astcenc_compress_reset(ctx);
+            auto worker = [&](unsigned t) {
+                const astcenc_error err = astcenc_compress_image(ctx, &img, &swz, L.blocks.data(), L.blocks.size(), t);
+                if (err != ASTCENC_SUCCESS)
+                    fprintf(stderr, "astcenc encode: %s\n", astcenc_get_error_string(err));
+            };
+            if (n == 1) {
+                worker(0);
+            } else {
+                std::vector<std::thread> pool;
+                for (unsigned t = 0; t < n; t++)
+                    pool.emplace_back(worker, t);
+                for (auto& th : pool)
+                    th.join();
+            }
+            out.push_back(std::move(L));
+            if (!mips || (w == 1 && h == 1))
+                break;
+            level = downsample(level, srgb);
+            continue;
+        }
 
         auto encodeRows = [&](uint32_t y0, uint32_t y1) {
             void* options = NULL;
@@ -384,12 +490,24 @@ static std::vector<Level> collectAnbcLevels(const anbcTexture* texture)
     return out;
 }
 
-static int writeChain(const Format& fmt, const std::string& path, const std::vector<Level>& levels)
+/* <base>.dds when the format has a DXGI id; ASTC formats also write
+ * <base>.astc (mip 0) and <base>_mipN.astc for the other levels. */
+static int writeChain(const Format& fmt, const std::string& base, const std::vector<Level>& levels)
 {
-    std::vector<ddsMip> mips;
-    for (const Level& L : levels)
-        mips.push_back({ L.blocks.data(), L.blocks.size(), L.w });
-    return ddsWriteBlocks(path.c_str(), fmt.dxgi, levels[0].w, levels[0].h, mips.data(), (uint32_t)mips.size());
+    int rc = 0;
+    if (fmt.dxgi) {
+        std::vector<ddsMip> mips;
+        for (const Level& L : levels)
+            mips.push_back({ L.blocks.data(), L.blocks.size(), L.w });
+        rc = ddsWriteBlocks((base + ".dds").c_str(), fmt.dxgi, levels[0].w, levels[0].h, mips.data(), (uint32_t)mips.size());
+    }
+    if (fmt.astc) {
+        for (size_t i = 0; i < levels.size(); i++) {
+            const std::string path = i == 0 ? base + ".astc" : base + "_mip" + std::to_string(i) + ".astc";
+            rc |= astcWriteFile(path.c_str(), levels[i].w, levels[i].h, levels[i].blocks.data(), levels[i].blocks.size());
+        }
+    }
+    return rc;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -398,11 +516,16 @@ static int writeChain(const Format& fmt, const std::string& path, const std::vec
 
 struct Options {
     const Format* format = &kFormatBC7;
+#ifdef __APPLE__
+    anbcDeviceBackend backend = ANBC_DEVICE_BACKEND_METAL;
+#else
+    anbcDeviceBackend backend = ANBC_DEVICE_BACKEND_VULKAN;
+#endif
     std::string modelDir = "checkpoints";
     std::string outDir = ".";
     float cmpQuality = 0.05f;
     uint32_t refineIters = 2;
-    bool srgb = false, mips = true, allowTensor = true;
+    bool srgb = false, mips = true, allowTensor = true, xcheck = false;
     unsigned threads = std::max(1u, std::thread::hardware_concurrency());
 };
 
@@ -448,7 +571,8 @@ static bool processImage(anbcDevice* device, const anbcDeviceInfo& devInfo, cons
     desc.height = src.h;
     desc.pixels = fmt.hdr ? (const void*)src.half.data() : (const void*)src.rgba.data();
     desc.pixelFormat = fmt.hdr ? ANBC_PIXEL_FORMAT_RGBA16_FLOAT : ANBC_PIXEL_FORMAT_RGBA8_UNORM;
-    desc.flags = (opt.srgb && !fmt.hdr ? ANBC_TEXTURE_FLAG_SRGB : 0) | (opt.mips ? ANBC_TEXTURE_FLAG_GENERATE_MIPS : 0);
+    desc.flags = (opt.srgb && !fmt.hdr ? ANBC_TEXTURE_FLAG_SRGB : 0) | (opt.mips ? ANBC_TEXTURE_FLAG_GENERATE_MIPS : 0) |
+                 (fmt.astc && fmt.channels == 2 ? ANBC_TEXTURE_FLAG_NORMAL_MAP : 0);
     anbcTexture* texture = anbcCreateTexture(device, &desc);
     if (!texture) {
         fprintf(stderr, "anbcCreateTexture failed for %s\n", imagePath.c_str());
@@ -498,10 +622,11 @@ static bool processImage(anbcDevice* device, const anbcDeviceInfo& devInfo, cons
     const double cmpMs = (now() - c0) * 1000.0;
 
     /* ---- outputs --------------------------------------------------------- */
-    const std::string anbcPath = opt.outDir + "/" + stem + "_anbc.dds";
-    const std::string cmpPath = opt.outDir + "/" + stem + "_cmp.dds";
-    writeChain(fmt, anbcPath, anbcLevels);
-    writeChain(fmt, cmpPath, cmpLevels);
+    const std::string outExt = fmt.dxgi ? ".dds" : ".astc";
+    const std::string anbcPath = opt.outDir + "/" + stem + "_anbc" + outExt;
+    const std::string cmpPath = opt.outDir + "/" + stem + "_cmp" + outExt;
+    writeChain(fmt, opt.outDir + "/" + stem + "_anbc", anbcLevels);
+    writeChain(fmt, opt.outDir + "/" + stem + "_cmp", cmpLevels);
 
     if (result) {
         result->stem = stem;
@@ -518,8 +643,14 @@ static bool processImage(anbcDevice* device, const anbcDeviceInfo& devInfo, cons
     const Image cmpDec = decodeBlocks(fmt, cmpLevels[0].blocks.data(), src.w, src.h);
     const Psnr pc = computePsnr(fmt, src, cmpDec);
 
-    /* Alpha is only stored by BC7; for BC5 the second column is left blank. */
-    const bool hasAlpha = fmt.anbc == ANBC_TEXTURE_FORMAT_BC7;
+    /* Alpha is only stored by BC7 and ASTC; for BC5 / normal maps / HDR the second column is left blank. */
+    const bool hasAlpha = fmt.anbc == ANBC_TEXTURE_FORMAT_BC7 || (fmt.anbc == ANBC_TEXTURE_FORMAT_ASTC_4x4_UNORM && fmt.channels == 3);
+    const char* refName = fmt.astc ? "astcenc" : "Compressonator CMP_Core";
+    char refDetail[64];
+    if (fmt.astc)
+        snprintf(refDetail, sizeof(refDetail), "-%s, %u threads", gAstcPresetName, opt.threads);
+    else
+        snprintf(refDetail, sizeof(refDetail), "quality %.2f, %u threads", opt.cmpQuality, opt.threads);
     auto alphaCol = [&](double v) {
         static char buf[32];
         if (hasAlpha) snprintf(buf, sizeof(buf), "%11.2fdB", v);
@@ -536,8 +667,8 @@ static bool processImage(anbcDevice* device, const anbcDeviceInfo& devInfo, cons
     }
     if (both)
         printf("%-28s %8.2fx  %+10.2fdB\n", "  tensor vs scalar", runs[0].ms / runs[1].ms, runs[1].p.rgb - runs[0].p.rgb);
-    printf("%-28s %8.2fms %11.2fdB %s   (%zu mips, quality %.2f, %u threads)\n",
-           "Compressonator CMP_Core", cmpMs, pc.rgb, alphaCol(pc.rgba), cmpLevels.size(), opt.cmpQuality, opt.threads);
+    printf("%-28s %8.2fms %11.2fdB %s   (%zu mips, %s)\n", refName, cmpMs, pc.rgb, alphaCol(pc.rgba), cmpLevels.size(),
+           refDetail);
 
     if (anbcLevels.size() > 1) {
         printf("\nanbc mip chain vs CPU reference (%s):\n",
@@ -567,18 +698,94 @@ static bool processImage(anbcDevice* device, const anbcDeviceInfo& devInfo, cons
     return ok;
 }
 
+/* Encodes `src` on `backend` (loading the format's models from opt.modelDir)
+ * and returns the mip chain; empty on failure. */
+static std::vector<Level> encodeOnBackend(anbcDeviceBackend backend, const Image& src, const Options& opt)
+{
+    const Format& fmt = *opt.format;
+    std::vector<Level> levels;
+    anbcDevice* device = anbcCreateDevice(backend);
+    if (!device) {
+        fprintf(stderr, "xcheck: anbcCreateDevice(%s) failed\n", backend == ANBC_DEVICE_BACKEND_METAL ? "METAL" : "VULKAN");
+        return levels;
+    }
+    for (const char* const* f = fmt.modelFiles; *f; f++) {
+        const std::string path = opt.modelDir + "/" + *f;
+        if (anbcLoadModel(device, fmt.anbc, path.c_str()) != ANBC_OK) {
+            fprintf(stderr, "xcheck: anbcLoadModel(%s) failed\n", path.c_str());
+            anbcDestroyDevice(device);
+            return levels;
+        }
+    }
+    anbcTextureDesc desc = {};
+    desc.width = src.w;
+    desc.height = src.h;
+    desc.pixels = fmt.hdr ? (const void*)src.half.data() : (const void*)src.rgba.data();
+    desc.pixelFormat = fmt.hdr ? ANBC_PIXEL_FORMAT_RGBA16_FLOAT : ANBC_PIXEL_FORMAT_RGBA8_UNORM;
+    desc.flags = (opt.srgb && !fmt.hdr ? ANBC_TEXTURE_FLAG_SRGB : 0) | (opt.mips ? ANBC_TEXTURE_FLAG_GENERATE_MIPS : 0) |
+                 (fmt.astc && fmt.channels == 2 ? ANBC_TEXTURE_FLAG_NORMAL_MAP : 0);
+    anbcTexture* texture = anbcCreateTexture(device, &desc);
+    anbcCompressOptions copts = { opt.refineIters, ANBC_COMPRESS_FLAG_NO_TENSOR_OPS };
+    if (texture && anbcCompress(device, texture, fmt.anbc, &copts) == ANBC_OK)
+        levels = collectAnbcLevels(texture);
+    else
+        fprintf(stderr, "xcheck: encode failed\n");
+    anbcDestroyTexture(texture);
+    anbcDestroyDevice(device);
+    return levels;
+}
+
+static bool crossCheck(const std::string& imagePath, const Options& opt)
+{
+    const Format& fmt = *opt.format;
+    Image src;
+    if (!loadImage(imagePath, fmt, src))
+        return false;
+    const std::vector<Level> metal = encodeOnBackend(ANBC_DEVICE_BACKEND_METAL, src, opt);
+    const std::vector<Level> vulkan = encodeOnBackend(ANBC_DEVICE_BACKEND_VULKAN, src, opt);
+    if (metal.empty() || vulkan.empty() || metal.size() != vulkan.size())
+        return false;
+
+    printf("\nMetal (scalar) vs Vulkan, %s:\n", fmt.name);
+    printf("  %-5s %11s %12s %12s %10s\n", "level", "size", "Metal", "Vulkan", "identical");
+    bool ok = true;
+    Image ref = src;
+    for (size_t level = 0; level < metal.size(); level++) {
+        const Level& a = metal[level];
+        const Level& b = vulkan[level];
+        if (level > 0)
+            ref = downsample(ref, opt.srgb && !fmt.hdr);
+        const Psnr pa = computePsnr(fmt, ref, decodeBlocks(fmt, a.blocks.data(), a.w, a.h));
+        const Psnr pb = computePsnr(fmt, ref, decodeBlocks(fmt, b.blocks.data(), b.w, b.h));
+        size_t same = 0;
+        const size_t blocks = a.blocks.size() / 16;
+        for (size_t i = 0; i < blocks; i++)
+            same += memcmp(&a.blocks[i * 16], &b.blocks[i * 16], 16) == 0;
+        char size[32];
+        snprintf(size, sizeof(size), "%ux%u", a.w, a.h);
+        printf("  %-5zu %11s %10.2fdB %10.2fdB %9.1f%%\n", level, size, pa.rgb, pb.rgb, 100.0 * same / blocks);
+        if (fabs(pa.rgb - pb.rgb) > 0.05)
+            ok = false;
+    }
+    if (!ok)
+        fprintf(stderr, "\nFAILED: Metal and Vulkan differ by more than 0.05 dB\n");
+    return ok;
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 2) {
         fprintf(stderr,
-                "usage: %s <image-or-folder> [--format bc7|bc6h|bc5] [--out dir] [--models dir] [--srgb]\n"
-                "          [--cmp-quality q] [--refine-iters n] [--no-mips] [--no-tensor-ops]\n"
-                "          [--threads n] [--single-thread]\n",
+                "usage: %s <image-or-folder> [--format bc7|bc6h|bc5|astc|astc-float] [--backend metal|vulkan]\n"
+                "          [--xcheck] [--normal-map] [--out dir]\n"
+                "          [--models dir] [--srgb] [--cmp-quality q] [--astc-preset fast|medium|thorough]\n"
+                "          [--refine-iters n] [--no-mips] [--no-tensor-ops] [--threads n] [--single-thread]\n",
                 argv[0]);
         return 2;
     }
     const std::string input = argv[1];
     Options opt;
+    bool normalMap = false;
     for (int i = 2; i < argc; i++) {
         const std::string a = argv[i];
         if (a == "--format" && i + 1 < argc) {
@@ -586,7 +793,25 @@ int main(int argc, char** argv)
             if (f == "bc7") opt.format = &kFormatBC7;
             else if (f == "bc6h") opt.format = &kFormatBC6H;
             else if (f == "bc5") opt.format = &kFormatBC5;
-            else { fprintf(stderr, "unknown format %s (bc7|bc6h|bc5)\n", f.c_str()); return 2; }
+            else if (f == "astc") opt.format = &kFormatASTC;
+            else if (f == "astc-float") opt.format = &kFormatASTCFloat;
+            else { fprintf(stderr, "unknown format %s (bc7|bc6h|bc5|astc|astc-float)\n", f.c_str()); return 2; }
+        }
+        else if (a == "--backend" && i + 1 < argc) {
+            const std::string b = argv[++i];
+            if (b == "metal") opt.backend = ANBC_DEVICE_BACKEND_METAL;
+            else if (b == "vulkan") opt.backend = ANBC_DEVICE_BACKEND_VULKAN;
+            else { fprintf(stderr, "unknown backend %s (metal|vulkan)\n", b.c_str()); return 2; }
+        }
+        else if (a == "--xcheck") opt.xcheck = true;
+        else if (a == "--normal-map") normalMap = true;
+        else if (a == "--astc-preset" && i + 1 < argc) {
+            const std::string q = argv[++i];
+            if (q == "fast") gAstcPreset = ASTCENC_PRE_FAST;
+            else if (q == "medium") gAstcPreset = ASTCENC_PRE_MEDIUM;
+            else if (q == "thorough") gAstcPreset = ASTCENC_PRE_THOROUGH;
+            else { fprintf(stderr, "unknown astc preset %s (fast|medium|thorough)\n", q.c_str()); return 2; }
+            gAstcPresetName = q == "fast" ? "fast" : q == "medium" ? "medium" : "thorough";
         }
         else if (a == "--models" && i + 1 < argc) opt.modelDir = argv[++i];
         else if (a == "--out" && i + 1 < argc) opt.outDir = argv[++i];
@@ -598,6 +823,13 @@ int main(int argc, char** argv)
         else if (a == "--no-mips") opt.mips = false;
         else if (a == "--no-tensor-ops") opt.allowTensor = false;
         else { fprintf(stderr, "unknown argument %s\n", argv[i]); return 2; }
+    }
+    if (normalMap) {
+        if (opt.format != &kFormatASTC) {
+            fprintf(stderr, "--normal-map only applies to --format astc\n");
+            return 2;
+        }
+        opt.format = &kFormatASTCNormal;
     }
 
     /* Folder or single image? */
@@ -625,15 +857,15 @@ int main(int argc, char** argv)
     mkdir(opt.outDir.c_str(), 0755);
 
     /* ---- device + models -------------------------------------------------- */
-    anbcDevice* device = anbcCreateDevice(ANBC_DEVICE_BACKEND_METAL);
+    anbcDevice* device = anbcCreateDevice(opt.backend);
     if (!device) {
-        fprintf(stderr, "anbcCreateDevice(METAL) failed\n");
+        fprintf(stderr, "anbcCreateDevice(%s) failed\n", opt.backend == ANBC_DEVICE_BACKEND_METAL ? "METAL" : "VULKAN");
         return 1;
     }
     anbcDeviceInfo devInfo;
     anbcGetDeviceInfo(device, &devInfo);
-    printf("device: %s, Metal 4: %s, tensor ops: %s, format: %s, Compressonator threads: %u\n", devInfo.name,
-           devInfo.metal4 ? "yes" : "no", devInfo.tensorOps ? "yes" : "no", opt.format->name, opt.threads);
+    printf("device: %s (%s), tensor ops: %s, format: %s, Compressonator threads: %u\n", devInfo.name,
+           devInfo.backend, devInfo.tensorOps ? "yes" : "no", opt.format->name, opt.threads);
     for (const char* const* f = opt.format->modelFiles; *f; f++) {
         const std::string path = opt.modelDir + "/" + *f;
         const anbcResult r = anbcLoadModel(device, opt.format->anbc, path.c_str());
@@ -641,12 +873,15 @@ int main(int argc, char** argv)
             fprintf(stderr, "anbcLoadModel(%s): %s\n", path.c_str(), anbcResultString(r));
             return 1;
         }
+        printf("loaded %s\n", path.c_str());
     }
 
     int rc = 0;
     if (!folder) {
         printf("%s\n", input.c_str());
         rc = processImage(device, devInfo, input, opt, true, NULL) ? 0 : 1;
+        if (opt.xcheck && !crossCheck(input, opt))
+            rc = 1;
     } else {
         std::vector<Result> results;
         double totalAnbc = 0, totalCmp = 0;
@@ -667,10 +902,10 @@ int main(int argc, char** argv)
             fflush(stdout);
         }
         printf("%s\n", std::string(96, '-').c_str());
-        printf("%zu textures: anbc %.1f ms total (%s), Compressonator %.1f ms total (%u threads), speedup %.1fx\n",
+        printf("%zu textures: anbc %.1f ms total (%s), %s %.1f ms total (%u threads), speedup %.1fx\n",
                results.size(), totalAnbc,
                opt.format->tensorKernel ? (devInfo.tensorOps && opt.allowTensor ? "tensor ops" : "scalar") : "GPU",
-               totalCmp, opt.threads, totalCmp / totalAnbc);
+               opt.format->astc ? "astcenc" : "Compressonator", totalCmp, opt.threads, totalCmp / totalAnbc);
 
         const std::string csvPath = opt.outDir + "/summary.csv";
         FILE* csv = fopen(csvPath.c_str(), "w");

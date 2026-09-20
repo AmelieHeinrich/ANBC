@@ -8,6 +8,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* ANBC_HAVE_METAL: the Metal backend (backend_metal.mm) is part of this build
+ * -- set by CMake on Apple platforms and by the single header when it is
+ * compiled as Objective-C++. */
+#ifndef ANBC_HAVE_METAL
+anbcResult anbcBackendMetalInit(anbcDevice* device)
+{
+    (void)device;
+    return ANBC_ERROR_UNSUPPORTED;
+}
+#endif
+
 const char* anbcResultString(anbcResult result)
 {
     switch (result) {
@@ -54,9 +65,9 @@ anbcDevice* anbcCreateDevice(anbcDeviceBackend backend)
 
     anbcResult r;
     switch (backend) {
-    case ANBC_DEVICE_BACKEND_CPU:   r = anbcBackendCpuInit(device); break;
-    case ANBC_DEVICE_BACKEND_METAL: r = anbcBackendMetalInit(device); break;
-    default:                        r = ANBC_ERROR_INVALID_ARGUMENT; break;
+    case ANBC_DEVICE_BACKEND_METAL:  r = anbcBackendMetalInit(device); break;
+    case ANBC_DEVICE_BACKEND_VULKAN: r = anbcBackendVulkanInit(device); break;
+    default:                         r = ANBC_ERROR_INVALID_ARGUMENT; break;
     }
     if (r != ANBC_OK) {
         free(device);
@@ -81,8 +92,8 @@ void anbcGetDeviceInfo(const anbcDevice* device, anbcDeviceInfo* outInfo)
     if (!outInfo)
         return;
     if (!device) {
-        outInfo->name = "none";
-        outInfo->metal4 = outInfo->tensorOps = 0;
+        outInfo->name = outInfo->backend = "none";
+        outInfo->tensorOps = 0;
         return;
     }
     *outInfo = device->info;
@@ -93,25 +104,15 @@ anbcResult anbcLoadModel(anbcDevice* device, anbcTextureFormat format, const cha
     if (!device || !path)
         return ANBC_ERROR_INVALID_ARGUMENT;
     if (format != ANBC_TEXTURE_FORMAT_BC7)
-        return ANBC_ERROR_UNSUPPORTED; /* BC5 and BC6H have no network */
+        return ANBC_ERROR_UNSUPPORTED; /* BC5, BC6H and ASTC have no network */
 
     anbcModel  model;
     anbcResult r = anbcModelLoad(path, &model);
     if (r != ANBC_OK)
         return r;
 
-    anbcModel* slot;
-    bool*      flag;
-    if (model.format == ANBC_MODEL_FORMAT_BC7 && model.mode == 6) {
-        slot = &device->bc7Mode6;
-        flag = &device->hasBc7Mode6;
-    } else if (model.format == ANBC_MODEL_FORMAT_BC7 && model.mode == 5) {
-        slot = &device->bc7Mode5;
-        flag = &device->hasBc7Mode5;
-    } else {
-        anbcModelFree(&model);
-        return ANBC_ERROR_BAD_MODEL;
-    }
+    anbcModel* slot = model.mode == 6 ? &device->bc7Mode6 : &device->bc7Mode5;
+    bool*      flag = model.mode == 6 ? &device->hasBc7Mode6 : &device->hasBc7Mode5;
 
     r = device->backend.uploadModel(device, &model);
     if (r != ANBC_OK) {
@@ -170,8 +171,8 @@ anbcResult anbcCompress(anbcDevice* device, anbcTexture* texture, anbcTextureFor
     if (format == ANBC_TEXTURE_FORMAT_BC7) {
         if (!device->hasBc7Mode6 || !device->hasBc7Mode5)
             return ANBC_ERROR_NO_MODEL;
-    } else if (format != ANBC_TEXTURE_FORMAT_BC5 && format != ANBC_TEXTURE_FORMAT_BC6H) { /* no model needed */
-        return ANBC_ERROR_UNSUPPORTED;
+    } else if (format != ANBC_TEXTURE_FORMAT_BC5 && format != ANBC_TEXTURE_FORMAT_BC6H && !anbcIsAstc(format)) {
+        return ANBC_ERROR_UNSUPPORTED; /* BC5 / BC6H / ASTC need no model */
     }
 
     anbcCompressOptions opts = { .refineIterations = 2, .flags = 0 };

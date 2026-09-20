@@ -21,6 +21,22 @@ static void ddsPutU32(FILE* f, uint32_t v)
 #define DDS_DXGI_FORMAT_BC5_UNORM 83
 #define DDS_DXGI_FORMAT_BC6H_UF16 95
 #define DDS_DXGI_FORMAT_BC7_UNORM 98
+#define DDS_DXGI_FORMAT_ASTC_4X4_UNORM 134 /* LDR only; there is no DXGI id for HDR ASTC */
+
+/* The .astc container (astcenc): magic, block dims, then x/y/z size as
+ * 24-bit little-endian, one level per file. Returns 0 on success. */
+static int astcWriteFile(const char* path, uint32_t width, uint32_t height, const void* blocks, size_t bytes)
+{
+    FILE* f = fopen(path, "wb");
+    if (!f)
+        return -1;
+    const uint8_t header[16] = { 0x13, 0xAB, 0xA1, 0x5C, 4, 4, 1,
+                                 (uint8_t)width, (uint8_t)(width >> 8), (uint8_t)(width >> 16),
+                                 (uint8_t)height, (uint8_t)(height >> 8), (uint8_t)(height >> 16), 1, 0, 0 };
+    fwrite(header, 1, 16, f);
+    fwrite(blocks, 1, bytes, f);
+    return fclose(f) == 0 ? 0 : -1;
+}
 
 /* Returns 0 on success. `dxgiFormat` is one of the DDS_DXGI_FORMAT_* above
  * (all are 16 bytes per 4x4 block). */

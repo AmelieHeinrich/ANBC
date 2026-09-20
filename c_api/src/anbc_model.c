@@ -35,6 +35,7 @@ anbcResult anbcModelLoad(const char* path, anbcModel* out)
     anbcResult result = ANBC_ERROR_BAD_MODEL;
     char       magic[4];
     uint32_t   version;
+    size_t     total = 0; /* declared up here: the gotos below may not skip an initialisation (C++ build of the single header) */
     if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "ANBC", 4) != 0)
         goto done;
     if (!readU32(f, &version) || (version != 1 && version != 2))
@@ -54,7 +55,6 @@ anbcResult anbcModelLoad(const char* path, anbcModel* out)
             goto done;
     }
 
-    size_t total = 0;
     for (uint32_t i = 0; i < out->numLayers; i++) {
         out->layerOffset[i] = total;
         total += (size_t)out->dims[i + 1] * out->dims[i] + out->dims[i + 1];

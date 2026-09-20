@@ -26,7 +26,8 @@ struct EncodeParams {
     uint refineIters;
     uint mipWidth;
     uint mipHeight;
-    uint pad0, pad1;
+    uint blockBase; // first output block of this mip (the Vulkan kernels index with it; Metal binds an offset address)
+    uint pad1;
 };
 
 // ---------------------------------------------------------------------------
@@ -35,6 +36,7 @@ struct EncodeParams {
 
 // dot() for the scalar case so the templates below work for float too.
 static inline float vdot(float a, float b) { return a * b; }
+static inline float vdot(float2 a, float2 b) { return dot(a, b); }
 static inline float vdot(float3 a, float3 b) { return dot(a, b); }
 static inline float vdot(float4 a, float4 b) { return dot(a, b); }
 

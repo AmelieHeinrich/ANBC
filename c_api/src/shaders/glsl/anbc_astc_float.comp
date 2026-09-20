@@ -1,0 +1,25 @@
+// ASTC 4x4 FLOAT (HDR RGB, CEM 11) encoder: one thread per 4x4 block, block
+// min/max + refinement in the LNS domain (no network). GLSL port of
+// anbc_astc_scalar.metal.
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+
+#include "anbc_astc_common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+void main()
+{
+    const uvec2 gid = gl_GlobalInvocationID.xy;
+    if (gid.x >= P.blocksX || gid.y >= P.blocksY)
+        return;
+    vec4 px[16];
+    loadBlock(gid, px);
+    // HDR texels -> LNS-domain pixels
+    vec3 lns[16];
+    for (uint i = 0u; i < 16u; i++)
+        lns[i] = vec3(lnsNorm(px[i].r), lnsNorm(px[i].g), lnsNorm(px[i].b));
+    vec3 e0 = lns[0], e1 = lns[0];
+    for (uint i = 1u; i < 16u; i++) { e0 = min(e0, lns[i]); e1 = max(e1, lns[i]); }
+    uOut.blocks[P.blockBase + gid.y * P.blocksX + gid.x] = encodeAstcFloat(lns, e0, e1, P.refineIters);
+}

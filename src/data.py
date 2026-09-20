@@ -4,7 +4,6 @@ extraction."""
 from __future__ import annotations
 
 import argparse
-import io
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -20,7 +19,7 @@ DIV2K_SETS = {
 }
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data" / "div2k"
-# DIV2K converted to HDR by src/convert_hdr_dataset.py (BC6H training set).
+# DIV2K converted to HDR by src/convert_hdr_dataset.py (BC6H / ASTC float validation set).
 HDR_DIR = Path(__file__).resolve().parent.parent / "data" / "hdr"
 
 
@@ -29,9 +28,6 @@ def _download(url: str, dest: Path) -> None:
         return
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
-
-    def _report(block_num: int, block_size: int, total_size: int) -> None:
-        pass
 
     print(f"Downloading {url} -> {dest}")
     with urllib.request.urlopen(url) as resp, open(tmp, "wb") as f:

@@ -1,0 +1,176 @@
+// Single-dispatch mip chain generator (FidelityFX SPD pattern), GLSL port of
+// anbc_mips.metal.
+//
+// Each 256-thread workgroup owns a 64x64 tile of mip 0 and produces mips 1..6
+// for it: mips 1-2 in registers, 3-6 through a 16x16 shared array. The last
+// workgroup to finish (atomic counter) then treats mip 6 (<= 64x64 for
+// textures up to 4096^2) as a single tile and produces mips 7..12 the same way.
+//
+// Filter is a 2x2 box, edge-clamped *at every level* (an odd-sized level's
+// last row/column is reused for the missing one, like the CPU references in
+// anbc_compare / compare_dds.py). The in-register and shared stages hold
+// phantom texels past a level's edge (computed from source texels clamped one
+// level up, which is not the same thing), so those reads clamp explicitly.
+// With kSRGB the RGB channels are decoded to linear before averaging and
+// re-encoded on store; alpha is always linear.
+//
+// Compiled twice, -DANBC_MIPS_FORMAT=rgba8 / rgba16f (storage images need a
+// format qualifier). Bindings (set 0): 0 sampler2D source (full chain, read
+// at lod 0 and 6), 1 image2D[12] the level views (levels >= numMips get a
+// stand-in the kernel never writes), 2 UBO MipParams, 3 SSBO counter.
+#version 450
+
+#ifndef ANBC_MIPS_FORMAT
+#define ANBC_MIPS_FORMAT rgba8
+#endif
+
+layout(constant_id = 1) const bool kSRGB = false;
+
+#define ANBC_MIPS_MAX_LEVELS 13
+#define ANBC_MIPS_TILE 64
+
+layout(set = 0, binding = 0) uniform sampler2D uSrc;
+layout(set = 0, binding = 1, ANBC_MIPS_FORMAT) uniform coherent writeonly image2D uOuts[ANBC_MIPS_MAX_LEVELS - 1];
+layout(std140, set = 0, binding = 2) uniform MipParams {
+    uint  numMips;
+    uint  numGroups;   // workgroups in phase 1 (tiles of mip 0)
+    uint  pad0, pad1;
+    uvec4 dims[ANBC_MIPS_MAX_LEVELS]; // .xy = size of each level
+} P;
+layout(std430, set = 0, binding = 3) coherent buffer Counter { uint counter; } uCounter;
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+shared vec4 tg[256];
+shared uint isLast;
+
+vec3 srgbToLinear(vec3 c)
+{
+    return mix(pow((c + 0.055) / 1.055, vec3(2.4)), c / 12.92, lessThanEqual(c, vec3(0.04045)));
+}
+
+vec3 linearToSrgb(vec3 c)
+{
+    return mix(1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, 12.92 * c, lessThanEqual(c, vec3(0.0031308)));
+}
+
+vec4 loadTexel(uint lod, uvec2 p, uvec2 dims)
+{
+    p = min(p, dims - 1u);
+    vec4 c = texelFetch(uSrc, ivec2(p), int(lod));
+    if (kSRGB)
+        c.rgb = srgbToLinear(c.rgb);
+    return c;
+}
+
+void storeTexel(uint level, uvec2 p, uvec2 dims, vec4 c)
+{
+    if (p.x >= dims.x || p.y >= dims.y)
+        return;
+    if (kSRGB)
+        c.rgb = linearToSrgb(c.rgb);
+    imageStore(uOuts[level - 1u], ivec2(p), c);
+}
+
+// Reduce the 64x64 tile at `tileOrigin` (in level `srcLod` texels) into levels
+// srcLod+1 .. srcLod+6. `tileIdx` is the tile's coordinate in the tile grid,
+// which is also its texel coordinate at level srcLod+6. All early returns are
+// on group-uniform conditions.
+void reduceTile(uint srcLod, uvec2 tileOrigin, uvec2 tileIdx, uvec2 lt, uint lidx)
+{
+    const uvec2 srcDims = P.dims[srcLod].xy;
+    const uvec2 base = tileOrigin + lt * 4u;
+
+    vec4 v[16];
+    for (uint j = 0u; j < 4u; j++)
+        for (uint i = 0u; i < 4u; i++)
+            v[j * 4u + i] = loadTexel(srcLod, base + uvec2(i, j), srcDims);
+
+    // level +1: 2x2 per thread
+    const uint l1 = srcLod + 1u;
+    if (l1 >= P.numMips)
+        return;
+    vec4 m1[4];
+    for (uint j = 0u; j < 2u; j++) {
+        for (uint i = 0u; i < 2u; i++) {
+            const uint r0 = (2u * j) * 4u + 2u * i;
+            const uint r1 = (2u * j + 1u) * 4u + 2u * i;
+            m1[j * 2u + i] = 0.25 * (v[r0] + v[r0 + 1u] + v[r1] + v[r1 + 1u]);
+            storeTexel(l1, tileIdx * 32u + lt * 2u + uvec2(i, j), P.dims[l1].xy, m1[j * 2u + i]);
+        }
+    }
+
+    // level +2: 1 per thread. This thread's 2x2 of level +1 texels starts at
+    // tileIdx * 32 + lt * 2; if the second column/row is past that level's
+    // edge, reuse the first (the edge clamp).
+    const uint l2 = srcLod + 2u;
+    if (l2 >= P.numMips)
+        return;
+    const uvec2 g1 = tileIdx * 32u + lt * 2u;
+    const uint cx = (g1.x + 1u < P.dims[l1].x) ? 1u : 0u;
+    const uint cy = (g1.y + 1u < P.dims[l1].y) ? 2u : 0u;
+    const vec4 m2 = 0.25 * (m1[0] + m1[cx] + m1[cy] + m1[cy + cx]);
+    storeTexel(l2, tileIdx * 16u + lt, P.dims[l2].xy, m2);
+    tg[lidx] = m2; // 16x16, stride 16
+
+    // levels +3..+6: 8x8, 4x4, 2x2, 1x1 through shared memory
+    for (uint k = 3u; k <= 6u; k++) {
+        const uint l = srcLod + k;
+        if (l >= P.numMips)
+            return;
+        const uint size = 16u >> (k - 2u);
+        const uint stride = size * 2u;
+        const bool isActive = lt.x < size && lt.y < size;
+
+        barrier();
+        vec4 m = vec4(0.0);
+        if (isActive) {
+            // Same edge clamp against level l-1 (whose texels tg holds, at
+            // global coordinates tileIdx * stride + local).
+            const uvec2 g = tileIdx * stride + lt * 2u;
+            const uint dx = (g.x + 1u < P.dims[l - 1u].x) ? 1u : 0u;
+            const uint dy = (g.y + 1u < P.dims[l - 1u].y) ? stride : 0u;
+            const uint r0 = (2u * lt.y) * stride + 2u * lt.x;
+            m = 0.25 * (tg[r0] + tg[r0 + dx] + tg[r0 + dy] + tg[r0 + dy + dx]);
+            storeTexel(l, tileIdx * size + lt, P.dims[l].xy, m);
+        }
+        barrier();
+        if (isActive)
+            tg[lt.y * size + lt.x] = m;
+    }
+}
+
+void main()
+{
+    const uvec2 groupId = gl_WorkGroupID.xy;
+    const uvec2 lt = gl_LocalInvocationID.xy;
+    const uint lidx = gl_LocalInvocationIndex;
+
+    reduceTile(0u, groupId * ANBC_MIPS_TILE, groupId, lt, lidx);
+
+    if (P.numMips <= 7u)
+        return;
+
+    // Publish this group's mip-6 texel to the rest of the device before
+    // counting ourselves done (the images and the counter are `coherent`).
+    memoryBarrierImage();
+    memoryBarrierBuffer();
+    barrier();
+    if (lidx == 0u) {
+        const uint prev = atomicAdd(uCounter.counter, 1u);
+        isLast = (prev == P.numGroups - 1u) ? 1u : 0u;
+    }
+    barrier();
+    if (isLast == 0u)
+        return;
+
+    memoryBarrierImage();
+    memoryBarrierBuffer();
+    barrier();
+
+    // Last group: mip 6 is one tile, produce 7..12.
+    reduceTile(6u, uvec2(0u), uvec2(0u), lt, lidx);
+
+    if (lidx == 0u)
+        uCounter.counter = 0u; // ready for the next dispatch
+}

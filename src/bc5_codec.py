@@ -1,15 +1,13 @@
 """BC5 codec: encoder (block min/max endpoints + exact-index / least-squares
-refinement), bit-exact packer, differentiable soft-decode (for the superseded
-MLP, see below) and wrappers around ispc-texcomp (ground truth) and
-texture2ddecoder (reference decoder). Built from the same generic pieces as
-bc7_codec.
+refinement), bit-exact packer and wrappers around ispc-texcomp (ground
+truth) and texture2ddecoder (reference decoder). Built from the same generic
+pieces as bc7_codec.
 
 No network: a BC4 line is 1-D, and the block's own min/max is already a
 near-optimal endpoint pair -- min/max + 2 refinement rounds scores ~56 dB on
-the normal-map set vs ~53 dB for Compressonator and ~46 dB for the BC5 MLP
-(train_bc7.py --mode bc5), whose too-wide endpoint guesses collapse
-low-contrast blocks to their mean. The MLP training path is kept for
-reference but nothing downstream uses it.
+the normal-map set vs ~53 dB for Compressonator and ~46 dB for a BC5 MLP
+(since removed), whose too-wide endpoint guesses collapsed low-contrast
+blocks to their mean.
 
 BC5 = two independent BC4 blocks, one for R and one for G (8 bytes each,
 R block first). BC4 block layout:
@@ -31,17 +29,9 @@ import torch
 
 import ispc_texcomp as _it
 import texture2ddecoder as _t2d
-from bc7_codec import (
-    _decoded_endpoint_torch,
-    _ls_endpoints,
-    quantize_endpoint_ste,
-    quantize_interp_ste,
-)
+from bc7_codec import _decoded_endpoint_torch, _ls_endpoints
 
-# Blend factor (weight of endpoint1) for each of the 8 BC4 indices, in index order.
-_WEIGHTS_BC4 = np.array([0, 7, 1, 2, 3, 4, 5, 6], dtype=np.float64) / 7.0
-
-# The same palette in *value* order is uniform: t = k/7 for k = 0..7. This LUT
+# The BC4 palette in *value* order is uniform: t = k/7 for k = 0..7. This LUT
 # maps that level k to the bitstream index (0 -> 0, 7 -> 1, k -> k + 1).
 _LEVEL_TO_INDEX = np.array([0, 2, 3, 4, 5, 6, 7, 1], dtype=np.int32)
 
@@ -85,35 +75,7 @@ def rg_to_rgb(rg01: np.ndarray) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Differentiable soft-decode used during training.
-# ---------------------------------------------------------------------------
-
-
-def soft_decode_bc5(
-    endpoint0_r: torch.Tensor,
-    endpoint1_r: torch.Tensor,
-    interp_r: torch.Tensor,
-    endpoint0_g: torch.Tensor,
-    endpoint1_g: torch.Tensor,
-    interp_g: torch.Tensor,
-) -> torch.Tensor:
-    """Differentiable BC5 reconstruction with independent R/G lines.
-
-    endpoint*_r / endpoint*_g: (..., 1) in [0,1]. interp_r / interp_g: (..., 16).
-    Returns (..., 16, 2) reconstructed RG in [0,1]. Quantization-aware:
-    endpoints snap to 8-bit and blend factors to the 8 real BC4 palette
-    weights, with straight-through gradients."""
-    out = []
-    for e0, e1, t in ((endpoint0_r, endpoint1_r, interp_r), (endpoint0_g, endpoint1_g, interp_g)):
-        e0q = quantize_endpoint_ste(e0, 8).unsqueeze(-2)  # (..., 1, 1)
-        e1q = quantize_endpoint_ste(e1, 8).unsqueeze(-2)
-        tq = quantize_interp_ste(t, _WEIGHTS_BC4).unsqueeze(-1)  # (..., 16, 1)
-        out.append(e0q * (1.0 - tq) + e1q * tq)
-    return torch.cat(out, dim=-1)
-
-
-# ---------------------------------------------------------------------------
-# Inference-time refinement (see bc7_codec for the rationale).
+# Refinement (see bc7_codec for the rationale).
 #
 # Unlike the BC7 lines, a BC4 line is 1-D and its palette is uniformly spaced
 # in value, so the exact index search is a projection onto the segment
@@ -226,18 +188,6 @@ def pack_bc5_blocks_batch_torch_arr(
         [_pack_bc4_torch(endpoint0_r, endpoint1_r, interp_r), _pack_bc4_torch(endpoint0_g, endpoint1_g, interp_g)],
         dim=1,
     )
-
-
-def pack_bc5_blocks_batch_torch(
-    endpoint0_r: torch.Tensor,
-    endpoint1_r: torch.Tensor,
-    interp_r: torch.Tensor,
-    endpoint0_g: torch.Tensor,
-    endpoint1_g: torch.Tensor,
-    interp_g: torch.Tensor,
-) -> bytes:
-    packed = pack_bc5_blocks_batch_torch_arr(endpoint0_r, endpoint1_r, interp_r, endpoint0_g, endpoint1_g, interp_g)
-    return packed.cpu().numpy().tobytes()
 
 
 # ---------------------------------------------------------------------------

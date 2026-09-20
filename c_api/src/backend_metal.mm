@@ -9,28 +9,22 @@
  * restructuring the command flow.
  *
  * Per anbcCompress: one command buffer, one compute encoder, one commit:
- *   [anbc_mips]  -> barrier -> anbc_bc7_encode | anbc_bc6h_encode | anbc_bc5_encode x mipCount
+ *   [anbc_mips]  -> barrier -> anbc_bc7_encode | anbc_bc6h_encode | anbc_bc5_encode
+ *                              | anbc_astc_*_encode x mipCount
  *                -> signal event -> CPU wait
- * BC7 runs the two MLPs (scalar or tensor-ops kernel); BC6H and BC5 have no
- * network (block min/max + refinement, one scalar kernel each).
+ * BC7 runs the two MLPs (scalar or tensor-ops kernel); BC6H, BC5 and ASTC
+ * have no network (block min/max + refinement, one scalar kernel each).
  */
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
+#include "anbc_blob.h"
 #include "anbc_internal.h"
 
 #include <cstdio>
 #include <cstring>
 #include <string>
-
-#include "anbc_bc5_metal.h"
-#include "anbc_bc6h_metal.h"
-#include "anbc_bc7_scalar_metal.h"
-#include "anbc_mips_metal.h"
-#if ANBC_HAVE_TENSOR_METALLIB
-#include "anbc_bc7_tensor_metallib.h"
-#endif
 
 namespace {
 
@@ -63,7 +57,8 @@ struct EncodeParams {
     uint32_t refineIters;
     uint32_t mipWidth;
     uint32_t mipHeight;
-    uint32_t pad0, pad1;
+    uint32_t blockBase;
+    uint32_t pad1;
 };
 
 constexpr size_t kParamsMipOffset = 0;
@@ -117,10 +112,12 @@ struct MetalDevice {
     id<MTLLibrary> bc7Library;
     id<MTLLibrary> bc6hLibrary;
     id<MTLLibrary> bc5Library;
+    id<MTLLibrary> astcLibrary;
     id<MTLLibrary> mipsLibrary;
     id<MTLComputePipelineState> encodePipeline;  // BC7 scalar
     id<MTLComputePipelineState> bc6hPipeline;    // BC6H (no network, so no tensor variant)
     id<MTLComputePipelineState> bc5Pipeline;     // BC5 (same)
+    id<MTLComputePipelineState> astcPipeline[ANBC_ASTC_KINDS]; // ASTC 4x4 per texture kind (same)
     id<MTLComputePipelineState> mipsPipeline[2]; // [srgb]
 
     // Tensor-ops path for the BC7 MLPs (M5-class GPUs only).
@@ -152,10 +149,17 @@ void logError(const char* what, NSError* error)
             error ? error.localizedDescription.UTF8String : "");
 }
 
-id<MTLLibrary> compileLibrary(MetalDevice* m, const char* source, const char* name)
+// Compiles the blob entry `name` (a NUL-terminated Metal source).
+id<MTLLibrary> compileLibrary(MetalDevice* m, const char* name)
 {
+    const void* source;
+    size_t      size;
+    if (!anbcBlobFind(name, &source, &size)) {
+        logError(name, nil);
+        return nil;
+    }
     MTL4LibraryDescriptor* desc = [[MTL4LibraryDescriptor alloc] init];
-    desc.source = [NSString stringWithUTF8String:source];
+    desc.source = [NSString stringWithUTF8String:(const char*)source];
     desc.name = [NSString stringWithUTF8String:name];
     MTLCompileOptions* opts = [[MTLCompileOptions alloc] init];
     opts.mathMode = MTLMathModeFast;
@@ -229,6 +233,8 @@ void metalDestroy(anbcDevice* device)
     device->backendData = nullptr;
 }
 
+bool isBc7Mode5(const anbcModel* model) { return model->mode == 5; }
+
 // The tensor kernel hardcodes the layer geometry (64 -> 128 -> 128 -> 128 -> out).
 bool tensorModelSupported(const anbcModel* model)
 {
@@ -238,16 +244,19 @@ bool tensorModelSupported(const anbcModel* model)
         if (model->dims[i] != kMlpMaxHidden)
             return false;
     const uint32_t out = model->dims[kTensorLayers];
-    return (model->mode == 6 && out == 24) || (model->mode == 5 && out == 40);
+    return isBc7Mode5(model) ? out == 40 : out == 24;
 }
 
 // Final layer padded to what the tensor kernel declares (anbc_bc7_tensor.metal).
-uint32_t tensorPaddedOut(const anbcModel* model) { return model->mode == 6 ? 32 : 64; }
+uint32_t tensorPaddedOut(const anbcModel* model) { return isBc7Mode5(model) ? 64 : 32; }
 
 NSString* modelLabel(const anbcModel* model, NSString* suffix)
 {
     return [(model->mode == 6 ? @"anbc bc7 mode6 " : @"anbc bc7 mode5 ") stringByAppendingString:suffix];
 }
+
+const char* const kAstcKernels[ANBC_ASTC_KINDS] = { "anbc_astc_game_encode", "anbc_astc_normal_encode",
+                                                    "anbc_astc_float_encode" };
 
 static inline size_t alignUp(size_t v, size_t a) { return (v + a - 1) & ~(a - 1); }
 
@@ -333,6 +342,14 @@ id<MTLComputePipelineState> bc6hPipeline(MetalDevice* m)
     return m->bc6hPipeline;
 }
 
+// ASTC pipelines, one per texture kind.
+id<MTLComputePipelineState> astcPipeline(MetalDevice* m, uint32_t kind)
+{
+    if (!m->astcPipeline[kind])
+        m->astcPipeline[kind] = buildPipeline(m, m->astcLibrary, kAstcKernels[kind], nil);
+    return m->astcPipeline[kind];
+}
+
 anbcResult metalUploadModel(anbcDevice* device, const anbcModel* model)
 {
     MetalDevice* m = md(device);
@@ -358,17 +375,13 @@ anbcResult metalUploadModel(anbcDevice* device, const anbcModel* model)
     memcpy(buf.contents, &header, sizeof(header));
     memcpy((uint8_t*)buf.contents + kModelWeightsOffset, model->data, model->dataFloats * sizeof(float));
 
-    if (model->mode == 6) {
-        dropResident(m, m->model6);
-        m->model6 = buf;
-    } else {
-        dropResident(m, m->model5);
-        m->model5 = buf;
-    }
+    id<MTLBuffer> __strong* bufSlot = model->mode == 6 ? &m->model6 : &m->model5;
+    dropResident(m, *bufSlot);
+    *bufSlot = buf;
     makeResident(m, buf);
 
     if (m->tensorOps) {
-        TensorModel& slot = (model->mode == 6) ? m->tensor6 : m->tensor5;
+        TensorModel& slot = model->mode == 6 ? m->tensor6 : m->tensor5;
         dropResident(m, slot.arena);
         slot = TensorModel();
         if (tensorModelSupported(model)) {
@@ -516,18 +529,20 @@ anbcResult metalCompress(anbcDevice* device, anbcTexture* texture, anbcTextureFo
                      visibilityOptions:MTL4VisibilityOptionDevice];
     }
 
-    const bool analytic = format == ANBC_TEXTURE_FORMAT_BC5 || format == ANBC_TEXTURE_FORMAT_BC6H;
-    const bool useTensor = !analytic && m->tensorOps && !(options->flags & ANBC_COMPRESS_FLAG_NO_TENSOR_OPS) &&
-                           m->tensor6.arena && m->tensor5.arena && tensorPipeline(m);
-    if (analytic) {
-        id<MTLComputePipelineState> pso = format == ANBC_TEXTURE_FORMAT_BC5 ? bc5Pipeline(m) : bc6hPipeline(m);
+    const bool noTensor = (options->flags & ANBC_COMPRESS_FLAG_NO_TENSOR_OPS) != 0;
+    bool useTensor = false;
+    if (format != ANBC_TEXTURE_FORMAT_BC7) {
+        // BC5 / BC6H / ASTC: no network, one scalar kernel each.
+        id<MTLComputePipelineState> pso = format == ANBC_TEXTURE_FORMAT_BC5    ? bc5Pipeline(m)
+                                          : format == ANBC_TEXTURE_FORMAT_BC6H ? bc6hPipeline(m)
+                                                                               : astcPipeline(m, anbcAstcKind(format, texture->flags));
         if (!pso) {
             [enc endEncoding];
             [m->commandBuffer endCommandBuffer];
             return ANBC_ERROR_BACKEND;
         }
         [enc setComputePipelineState:pso];
-    } else if (useTensor) {
+    } else if ((useTensor = m->tensorOps && !noTensor && m->tensor6.arena && m->tensor5.arena && tensorPipeline(m))) {
         [enc setComputePipelineState:m->tensorPipeline];
         const TensorModel* models[2] = { &m->tensor6, &m->tensor5 };
         const NSUInteger base[2] = { kBufTensor6, kBufTensor5 };
@@ -613,11 +628,12 @@ anbcResult anbcBackendMetalInit(anbcDevice* device)
         }
         [m->queue addResidencySet:m->residencySet];
 
-        m->bc7Library = compileLibrary(m, ANBC_BC7_SCALAR_METAL_SOURCE, "anbc_bc7_scalar");
-        m->bc6hLibrary = compileLibrary(m, ANBC_BC6H_METAL_SOURCE, "anbc_bc6h");
-        m->bc5Library = compileLibrary(m, ANBC_BC5_METAL_SOURCE, "anbc_bc5");
-        m->mipsLibrary = compileLibrary(m, ANBC_MIPS_METAL_SOURCE, "anbc_mips");
-        if (!m->bc7Library || !m->bc6hLibrary || !m->bc5Library || !m->mipsLibrary) {
+        m->bc7Library = compileLibrary(m, "bc7_scalar.metal");
+        m->bc6hLibrary = compileLibrary(m, "bc6h.metal");
+        m->bc5Library = compileLibrary(m, "bc5.metal");
+        m->astcLibrary = compileLibrary(m, "astc_scalar.metal");
+        m->mipsLibrary = compileLibrary(m, "mips.metal");
+        if (!m->bc7Library || !m->bc6hLibrary || !m->bc5Library || !m->astcLibrary || !m->mipsLibrary) {
             delete m;
             return ANBC_ERROR_BACKEND;
         }
@@ -628,20 +644,20 @@ anbcResult anbcBackendMetalInit(anbcDevice* device)
         }
 
         // Shader tensor ops are only hardware accelerated from the M5 / A19
-        // generation (Apple GPU family 10). Older GPUs keep the scalar kernel.
-#if ANBC_HAVE_TENSOR_METALLIB
-        if ([dev supportsFamily:MTLGPUFamilyApple10]) {
-            dispatch_data_t data = dispatch_data_create(ANBC_BC7_TENSOR_METALLIB, ANBC_BC7_TENSOR_METALLIB_size,
-                                                        nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+        // generation (Apple GPU family 10). Older GPUs keep the scalar kernel,
+        // as does a blob built without the Metal toolchain (no metallib).
+        const void* metallib;
+        size_t      metallibSize;
+        if ([dev supportsFamily:MTLGPUFamilyApple10] && anbcBlobFind("bc7_tensor.metallib", &metallib, &metallibSize)) {
+            dispatch_data_t data = dispatch_data_create(metallib, metallibSize, nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
             m->tensorLibrary = [dev newLibraryWithData:data error:&error];
             m->tensorOps = m->tensorLibrary != nil;
             if (!m->tensorOps)
                 logError("tensor kernel library failed to load, falling back to scalar", error);
         }
-#endif
         m->name = dev.name.UTF8String;
         device->info.name = m->name.c_str();
-        device->info.metal4 = 1;
+        device->info.backend = "Metal 4";
         device->info.tensorOps = m->tensorOps ? 1 : 0;
 
         m->params = [dev newBufferWithLength:kParamsBytes options:MTLResourceStorageModeShared];

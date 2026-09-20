@@ -1,0 +1,18 @@
+// BC6H (UF16, mode 11) encoder: one thread per 4x4 block, block min/max +
+// refinement (no network). GLSL port of anbc_bc6h_scalar.metal.
+#version 450
+#extension GL_GOOGLE_include_directive : enable
+
+#include "anbc_bc6h_common.glsl"
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+void main()
+{
+    const uvec2 gid = gl_GlobalInvocationID.xy;
+    if (gid.x >= P.blocksX || gid.y >= P.blocksY)
+        return;
+    vec4 px[16];
+    loadBlock(gid, px);
+    uOut.blocks[P.blockBase + gid.y * P.blocksX + gid.x] = encodeBlockBc6h(px);
+}
